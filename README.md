@@ -150,6 +150,7 @@ screenshots/               README 用截图
 ## 致谢 / Special Thanks
 
 Special Thanks to: 森岫Official & His almighty Cutex
+
 see Cutex at: https://github.com/senxiu-official/cutex-desktop
 
 ## 许可
