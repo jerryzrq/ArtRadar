@@ -1,7 +1,6 @@
 $ErrorActionPreference = "Stop"
 $Root = Split-Path $PSScriptRoot -Parent
-$Py = "C:\Users\pc\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe"
-if (-not (Test-Path $Py)) { $Py = "python" }
+$Py = if ($env:ART_RADAR_PYTHON) { $env:ART_RADAR_PYTHON } else { "python" }
 
 Get-Process ArtRadar -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Seconds 1

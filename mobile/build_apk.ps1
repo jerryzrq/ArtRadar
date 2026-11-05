@@ -1,11 +1,13 @@
 ﻿$ErrorActionPreference = "Stop"
 $Root = $PSScriptRoot
-$BuildRoot = "C:\AndroidBuild"
+$BuildRoot = if ($env:ANDROID_BUILD_ROOT) { $env:ANDROID_BUILD_ROOT } else { "C:\AndroidBuild" }
 $Sdk = Join-Path $BuildRoot "sdk"
 $BuildTools = Join-Path $Sdk "build-tools\34.0.0"
 $Platform = Join-Path $Sdk "platforms\android-34"
 $AndroidJar = Join-Path $Platform "android.jar"
-$Py = "C:\Users\pc\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe"
+$Py = if ($env:ART_RADAR_PYTHON) { $env:ART_RADAR_PYTHON } else { "python" }
+$KsPass = $env:ART_RADAR_KS_PASS
+$KsAlias = if ($env:ART_RADAR_KS_ALIAS) { $env:ART_RADAR_KS_ALIAS } else { "artradar" }
 
 if (-not (Test-Path $AndroidJar)) { throw "缺少 android.jar: $AndroidJar" }
 if (-not (Test-Path (Join-Path $BuildTools "aapt2.exe"))) { throw "缺少 build-tools" }
@@ -56,15 +58,16 @@ if ($LASTEXITCODE -ne 0) { throw "zipalign failed" }
 
 Write-Host "7/7 sign"
 $Ks = Join-Path $Root "artradar-release.keystore"
+if (-not $KsPass) { throw "请先设置 keystore 密码：`$env:ART_RADAR_KS_PASS = '你的密码'" }
 if (-not (Test-Path $Ks)) {
-    & (Join-Path $Jdk "bin\keytool.exe") -genkeypair -keystore $Ks -storepass artradar123 `
-        -keypass artradar123 -alias artradar -keyalg RSA -keysize 2048 -validity 10000 `
+    & (Join-Path $Jdk "bin\keytool.exe") -genkeypair -keystore $Ks -storepass $KsPass `
+        -keypass $KsPass -alias $KsAlias -keyalg RSA -keysize 2048 -validity 10000 `
         -dname "CN=ArtRadar, O=ArtRadar, C=CN"
     if ($LASTEXITCODE -ne 0) { throw "keytool failed" }
 }
 $Out = Join-Path $Root "ArtRadarMobile.apk"
-& (Join-Path $BuildTools "apksigner.bat") sign --ks $Ks --ks-pass pass:artradar123 `
-    --key-pass pass:artradar123 --out $Out (Join-Path $Work "app-aligned.apk")
+& (Join-Path $BuildTools "apksigner.bat") sign --ks $Ks --ks-pass "pass:$KsPass" `
+    --key-pass "pass:$KsPass" --out $Out (Join-Path $Work "app-aligned.apk")
 if ($LASTEXITCODE -ne 0) { throw "apksigner failed" }
 & (Join-Path $BuildTools "apksigner.bat") verify $Out
 if ($LASTEXITCODE -ne 0) { throw "apksigner verify failed" }
