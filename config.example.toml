@@ -1,0 +1,98 @@
+# ArtRadar 配置模板
+# 复制到 exe 同目录并重命名为 config.toml，再按自己的情况改。
+# 所有路径建议用正斜杠 / 。
+
+[paths]
+root = "D:/Art/Reference"         # 图库根目录（分类文件夹就建在这下面）
+meta = ".artradar"                # 索引 / 缩略图 / 待确认清单放这里
+
+[collect]
+per_source = 5                    # 每个来源最多取多少条候选
+min_side = 700                    # 短边小于该值的图直接丢弃（Pinterest 会自动放宽到 500）
+thumb_px = 720                    # 预览图最长边
+request_interval = 1.0            # 下载间隔（秒），别把站点打疼
+proxy = ""                        # 需要代理才能访问 Pixiv 时填，如 "http://127.0.0.1:7890"
+timeout = 30
+
+[collect.quality]
+enabled = true                    # 自动把空白 / 严重模糊 / 过度压缩的图丢进「已拒绝」
+
+# ---- Pixiv：免登录榜单 ----
+[[sources]]
+type = "pixiv_ranking"
+enabled = true
+name = "pixiv-daily"
+mode = "daily"                    # daily / weekly / monthly / rookie / original
+pages = 1
+
+[[sources]]
+type = "pixiv_tag"                # 按标签找参考方向
+enabled = true
+name = "pixiv-refs"
+tags = ["構図", "光", "ポーズ", "背景", "衣装"]
+per_tag = 2
+limit = 10
+order = "popular_d"               # 热度排序
+
+[[sources]]
+type = "pixiv_ranking"
+enabled = true
+name = "pixiv-rookie"
+mode = "rookie"                   # 新人榜，适合发现新画师
+
+# ---- Pixiv：登录后的关注流（需要先在网页里登录）----
+[[sources]]
+type = "pixiv_follow"
+enabled = false
+name = "pixiv-follow"
+pages = 2
+
+# ---- 微博：指定画师 + 关注列表自动发现 ----
+[[sources]]
+type = "weibo_artists"
+enabled = false
+name = "weibo-artists"
+uids = []                         # 微博个人主页 URL 里的那串数字，例如 "1781389052"
+per_uid = 1
+limit = 40
+auto_following = false            # true 时把关注列表里的画师 / 艺术博主也纳入
+
+# ---- Pinterest：公开搜索页，无需登录 ----
+[[sources]]
+type = "pinterest_search"
+enabled = true
+name = "pinterest-refs"
+queries = [
+  "cinematic lighting reference",
+  "dynamic pose reference",
+  "environment concept art",
+  "composition reference",
+  "anatomy reference",
+  "costume design reference",
+]
+per_query = 2
+
+# ---- 通用 RSS（RSSHub / rss.app 等）----
+[[sources]]
+type = "rss"
+enabled = false
+name = "rss-feed"
+url = "https://rsshub.app/pixiv/ranking/day"
+
+[review]
+top_n = 12                        # 今日精选推多少条
+expire_days = 10                  # 一直不确认的候选多久后过期
+
+[filing]
+reference_dir = "."               # 分类文件夹直接建在图库根目录下
+artists_dir = "画师"
+favorites_dir = "收藏"
+tags = ["光影", "动态", "场景", "构图", "人体", "服装", "cosplay", "角色参考"]
+favorite_artists = []
+
+# 画师名归一化，例如把不同写法合并到同一个文件夹
+[filing.artist_aliases]
+# "某画师P站名" = "常用名"
+
+[notify]
+webhook = ""                      # 可选：采集完成后的回调地址
