@@ -1,0 +1,5 @@
+# 图库和配置不进版本库（配置里可能放 Cookie / token）
+library/
+config.toml
+__pycache__/
+*.pyc

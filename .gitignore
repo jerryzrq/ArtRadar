@@ -1,0 +1,29 @@
+# ---- 构建产物 / 打包文件（体积大，不进仓库）----
+build/
+dist/
+Patches/
+logs/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- 本地配置与登录态（可能含 Cookie / token / 本机路径）----
+config.toml
+.artradar/
+
+# ---- 签名密钥，绝对不要提交 ----
+*.keystore
+*.jks
+*.p12
+*.pfx
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store

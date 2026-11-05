@@ -1,0 +1,2031 @@
+--- a/art-radar/artradar.py
++++ b/art-radar/artradar.py
+@@ -27,6 +27,7 @@
+ import sqlite3
+ import subprocess
+ import sys
++import threading
+ import time
+ import tomllib
+ import urllib.error
+@@ -302,6 +303,13 @@
+ """
+ 
+ 
++def atomic_write(path: Path, text: str) -> None:
++    """整份覆写的状态文件先写临时文件再替换，中途崩溃或断电不会留下半截 JSON。"""
++    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
++    tmp.write_text(text, encoding="utf-8")
++    os.replace(tmp, path)
++
++
+ def db(cfg: dict) -> sqlite3.Connection:
+     path = cfg["_meta"] / "index.sqlite"
+     try:
+@@ -981,12 +989,12 @@
+                 sid = m.group(1) if m else hashlib.sha1(url_src.encode()).hexdigest()[:32]
+                 if sid in skip_ids:
+                     continue
+-                alt = (item.get("alt") or "").strip()
++                alt = clean_pin_title(item.get("alt") or "")
+                 out.append({
+                     "source": "pinterest",
+                     "source_id": sid,
+                     "artist": "",
+-                    "title": alt if alt and alt.lower() != "pin" else f"Pinterest · {query}",
++                    "title": alt or f"Pinterest · {query}",
+                     "page_url": url,
+                     "image_url": url_src,
+                     "fallback_url": url_src.replace("/originals/", "/736x/"),
+@@ -1359,7 +1367,7 @@
+     ensure_layout(cfg)
+     con = db(cfg)
+     cutoff = iso(now_utc() - timedelta(days=int(cfg["review"]["expire_days"])))
+-    con.execute("UPDATE items SET status='expired', decided_at=? WHERE status='pending' AND created_at<?",
++    con.execute("UPDATE items SET status='expired', decided_at=? WHERE status='pending' AND filed_path IS NULL AND created_at<?",
+                 (iso(now_utc()), cutoff))
+     con.commit()
+ 
+@@ -1407,6 +1415,17 @@
+     return "auto"
+ 
+ 
++PIN_ALT_PREFIX = re.compile(
++    r"^\s*(this may contain|may contain|其中包括图片|其中可能包括图片|此图片可能包含|この画像に含まれているもの)\s*[:：]?\s*",
++    re.I)
++
++
++def clean_pin_title(title: str) -> str:
++    """去掉 Pinterest 自动生成的 alt 前缀（「其中包括图片：」），只剩前缀时返回空。"""
++    t = PIN_ALT_PREFIX.sub("", title or "").strip()
++    return "" if t.lower() == "pin" else t
++
++
+ def clean_keywords(text: str) -> list[str]:
+     t = (text or "").replace("“", "").replace("”", "").replace('"', "").replace("'", "")
+     t = t.replace("@", " ")
+@@ -1678,9 +1697,9 @@
+     items = pending_items(cfg, con, limit=200, use_snapshot=False)
+     day = datetime.now().strftime("%Y-%m-%d")
+     path = cfg["_meta"] / "digests" / f"{day}.html"
+-    (cfg["_meta"] / "pending.json").write_text(
+-        json.dumps({"generated_at": iso(now_utc()), "items": items},
+-                   ensure_ascii=False, indent=2), encoding="utf-8")
++    atomic_write(cfg["_meta"] / "pending.json",
++                 json.dumps({"generated_at": iso(now_utc()), "items": items},
++                            ensure_ascii=False, indent=2))
+ 
+     cards = []
+     for it in items:
+@@ -1926,7 +1945,8 @@
+         if rel.parts[0] in (cfg["paths"].get("meta", ".artradar"), "00_inbox"):
+             continue
+         sid = str(rel)
+-        if con.execute("SELECT 1 FROM items WHERE source='local' AND source_id=?", (sid,)).fetchone():
++        if con.execute("SELECT 1 FROM items WHERE (source='local' AND source_id=?) OR filed_path=?",
++                       (sid, str(f))).fetchone():
+             continue
+         try:
+             im = Image.open(f)
+@@ -2064,8 +2084,8 @@
+         it["index"] = i
+         it["suggested"] = guess_category(it)
+     path = cfg["_meta"] / "today.json"
+-    path.write_text(json.dumps({"generated_at": iso(now_utc()), "items": picked},
+-                               ensure_ascii=False, indent=2), encoding="utf-8")
++    atomic_write(path, json.dumps({"generated_at": iso(now_utc()), "items": picked},
++                                  ensure_ascii=False, indent=2))
+     log(f"今日精选 {len(picked)} 条 -> {path}")
+     for it in picked:
+         log(f'{it["index"]:>2}. {it["id"]}  {it["suggested"]:<4}  '
+@@ -2079,20 +2099,31 @@
+         return []
+ 
+ 
++LOW_RES_NOTE = "原图下载失败，存的是预览图"
++
++
+ def file_item(cfg: dict, con: sqlite3.Connection, iid: str, tags: list[str] | None = None,
+               note: str = "", artist: bool = False, folder: str | None = None) -> Path | None:
+     """把一条候选归档；返回目标文件路径。CLI 和网页 UI 共用。"""
+     row = con.execute("SELECT * FROM items WHERE id=?", (iid,)).fetchone()
+     if not row:
+         return None
++    artist_name = (row["artist"] or "").strip()
++    folder_artist = cfg["filing"].get("artist_aliases", {}).get(artist_name, artist_name)
+     if row["status"] == "kept" and row["filed_path"]:
++        if artist and artist_name:
++            return move_item(cfg, con, iid,
++                             f'{cfg["filing"]["artists_dir"]}/{safe_name(folder_artist, 40)}',
++                             keep_tags=True)
+         return Path(row["filed_path"])
+-    cur_tags = list(dict.fromkeys(tags or []))
++    explicit = bool(tags)
++    # 没指定分类时用人工选的（可多个）；文件只放第一个分类的文件夹，其余分类记在索引和边车里
++    cur_tags = list(dict.fromkeys(tags or split_tags(row["tags_manual"])))
++    for t in cur_tags:
++        check_tag(t)
+     if not folder and cur_tags and "/" in cur_tags[0]:
+         folder = cur_tags[0]
+-        cur_tags = [cur_tags[0].rsplit("/", 1)[-1]]
+-    artist_name = (row["artist"] or "").strip()
+-    folder_artist = cfg["filing"].get("artist_aliases", {}).get(artist_name, artist_name)
++        cur_tags[0] = cur_tags[0].rsplit("/", 1)[-1]
+     is_artist = bool(artist_name) and (artist or artist_name in cfg["filing"].get("favorite_artists", []))
+     if is_artist and not cur_tags:
+         cur_tags = ["画师"]
+@@ -2106,13 +2137,26 @@
+         dest_dir = cfg["_root"] / cfg["filing"]["reference_dir"] / safe_name(cur_tags[0], 40)
+     else:
+         dest_dir = cfg["_root"] / cfg["filing"]["favorites_dir"]
++    # 取消收藏过的图：文件还在，不重新下载；没改分类就放回原文件夹
++    stashed = Path(row["filed_path"]) if row["filed_path"] else None
++    if stashed and not stashed.exists():
++        stashed = None
++    if stashed and not explicit and not artist and row["folder"]:
++        dest_dir = Path(row["folder"])
+     dest_dir.mkdir(parents=True, exist_ok=True)
+ 
+-    try:
+-        data, ext = fetch_full_image(row, cfg)
+-    except Exception as exc:  # noqa: BLE001
+-        log(f"  {iid} 原图下载失败，使用预览图: {exc}")
+-        data, ext = Path(row["thumb"]).read_bytes(), ".jpg"
++    data = None
++    low_res = False
++    if stashed:
++        ext = stashed.suffix
++    else:
++        try:
++            data, ext = fetch_full_image(row, cfg)
++        except Exception as exc:  # noqa: BLE001
++            log(f"  {iid} 原图下载失败，使用预览图: {exc}")
++            data, ext = Path(row["thumb"]).read_bytes(), ".jpg"
++            low_res = True
++            note = note or LOW_RES_NOTE
+ 
+     stem = safe_name(f'{datetime.now():%Y%m%d}_{artist_name or "unknown"}_{row["title"] or ""}_{iid}', 110)
+     dest = dest_dir / f"{stem}{ext}"
+@@ -2120,7 +2164,13 @@
+     while dest.exists():
+         dest = dest_dir / f"{stem}_{n}{ext}"
+         n += 1
+-    dest.write_bytes(data)
++    if stashed:
++        side = stashed.with_suffix(".json")
++        if side.exists() and _is_our_sidecar(side):
++            side.unlink(missing_ok=True)
++        shutil.move(str(stashed), str(dest))
++    else:
++        dest.write_bytes(data)
+ 
+     sidecar = {
+         "id": iid, "source": row["source"], "source_id": row["source_id"],
+@@ -2128,10 +2178,9 @@
+         "image_url": row["image_url"], "tags": cur_tags, "note": note,
+         "score": row["score"], "width": row["width"], "height": row["height"],
+         "published_at": row["published_at"], "collected_at": row["created_at"],
+-        "filed_at": iso(now_utc()), "file": dest.name,
++        "filed_at": iso(now_utc()), "file": dest.name, "low_res": low_res,
+     }
+-    dest.with_suffix(".json").write_text(
+-        json.dumps(sidecar, ensure_ascii=False, indent=2), encoding="utf-8")
++    atomic_write(dest.with_suffix(".json"), json.dumps(sidecar, ensure_ascii=False, indent=2))
+     con.execute("UPDATE items SET status='kept', tags=?, tags_manual=?, note=?, folder=?, filed_path=?, decided_at=? WHERE id=?",
+                 (",".join(cur_tags), ",".join(cur_tags), note, str(dest_dir), str(dest), iso(now_utc()), iid))
+     con.commit()
+@@ -2151,7 +2200,88 @@
+         return False
+ 
+ 
+-def move_item(cfg: dict, con: sqlite3.Connection, iid: str, rel_folder: str) -> Path:
++def split_tags(value: str | None) -> list[str]:
++    return [t.strip() for t in (value or "").split(",") if t.strip()]
++
++
++def check_tag(tag: str) -> None:
++    """分类名会变成文件夹路径，也用逗号拼接存储，这里挡掉越出图库和拼接冲突的写法。"""
++    if not tag or "," in tag or ":" in tag or tag.startswith(("/", "\\")) \
++            or ".." in re.split(r"[\\/]", tag):
++        raise ValueError(f"分类名不合法：{tag}")
++
++
++def _sync_sidecar(path: Path, tags: list[str]) -> None:
++    side = path.with_suffix(".json")
++    if not side.exists() or not _is_our_sidecar(side):
++        return
++    data = json.loads(side.read_text(encoding="utf-8"))
++    data.update(tags=tags, file=path.name)
++    atomic_write(side, json.dumps(data, ensure_ascii=False, indent=2))
++
++
++def migrate_artist(cfg: dict, con: sqlite3.Connection, name: str) -> int:
++    """把这位画师已收藏、还不在画师文件夹里的图移过去，分类不变。单张失败不影响其它。"""
++    alias = cfg["filing"].get("artist_aliases", {}).get(name, name)
++    target = f'{cfg["filing"]["artists_dir"]}/{safe_name(alias, 40)}'
++    dest_dir = cfg["_root"] / target
++    moved = 0
++    rows = con.execute("SELECT id, filed_path FROM items WHERE artist=? AND status='kept' AND filed_path IS NOT NULL",
++                       (name,)).fetchall()
++    for row in rows:
++        path = Path(row["filed_path"])
++        if path.parent == dest_dir or not path.exists():
++            continue
++        try:
++            new_path = move_item(cfg, con, row["id"], target, keep_tags=True)
++            _sync_sidecar(new_path, split_tags(con.execute(
++                "SELECT tags_manual FROM items WHERE id=?", (row["id"],)).fetchone()[0]))
++            moved += 1
++        except (OSError, ValueError) as exc:
++            log(f"  {row['id']} 移动失败: {exc}")
++    return moved
++
++
++def retag_kept(cfg: dict, con: sqlite3.Connection, iid: str, tags: list[str]) -> None:
++    """改已收藏图的分类。文件已在其中一个分类文件夹（或画师文件夹）里就不动，否则移到第一个分类。"""
++    row = con.execute("SELECT * FROM items WHERE id=?", (iid,)).fetchone()
++    path = Path(row["filed_path"])
++    try:
++        rel = path.parent.relative_to(cfg["_root"]).as_posix()
++    except ValueError:
++        rel = ""
++    in_artists = rel.split("/")[0] == cfg["filing"]["artists_dir"]
++    if tags and not in_artists and rel not in tags:
++        first = tags[0] if "/" in tags[0] else safe_name(tags[0], 40)
++        path = move_item(cfg, con, iid, first, keep_tags=True)
++    joined = ",".join(tags)
++    con.execute("UPDATE items SET tags=?, tags_manual=? WHERE id=?", (joined, joined, iid))
++    con.commit()
++    _sync_sidecar(path, tags)
++
++
++def unfile_item(cfg: dict, con: sqlite3.Connection, iid: str, status: str = "pending", note: str = "") -> None:
++    """把已归档的图移出分类文件夹，暂存到 .artradar/unfiled，再次收藏时直接放回，不用重新下载。"""
++    row = con.execute("SELECT * FROM items WHERE id=?", (iid,)).fetchone()
++    if not row or not row["filed_path"]:
++        return
++    old = Path(row["filed_path"])
++    stash_dir = cfg["_meta"] / "unfiled"
++    if old.exists() and old.parent != stash_dir:
++        stash_dir.mkdir(parents=True, exist_ok=True)
++        dest = stash_dir / f"{iid}{old.suffix}"
++        side = old.with_suffix(".json")
++        if side.exists() and _is_our_sidecar(side):
++            side.unlink(missing_ok=True)
++        shutil.move(str(old), str(dest))
++        con.execute("UPDATE items SET filed_path=? WHERE id=?", (str(dest), iid))
++    con.execute("UPDATE items SET status=?, note=?, decided_at=? WHERE id=?",
++                (status, note, iso(now_utc()), iid))
++    con.commit()
++
++
++def move_item(cfg: dict, con: sqlite3.Connection, iid: str, rel_folder: str, keep_tags: bool = False) -> Path:
++    check_tag(rel_folder)
+     row = con.execute("SELECT * FROM items WHERE id=?", (iid,)).fetchone()
+     if not row or not row["filed_path"]:
+         raise ValueError("这条还没有归档")
+@@ -2168,9 +2298,12 @@
+         side = old.with_suffix(".json")
+         if side.exists() and _is_our_sidecar(side):
+             shutil.move(str(side), str(dest.with_suffix(".json")))
+-    tag = "画师" if rel_folder.startswith(cfg["filing"]["artists_dir"] + "/") else rel_folder
+-    con.execute("UPDATE items SET folder=?, filed_path=?, tags=?, tags_manual=? WHERE id=?",
+-                (str(dest_dir), str(dest), tag, tag, iid))
++    if keep_tags:
++        con.execute("UPDATE items SET folder=?, filed_path=? WHERE id=?", (str(dest_dir), str(dest), iid))
++    else:
++        tag = "画师" if rel_folder.startswith(cfg["filing"]["artists_dir"] + "/") else rel_folder
++        con.execute("UPDATE items SET folder=?, filed_path=?, tags=?, tags_manual=? WHERE id=?",
++                    (str(dest_dir), str(dest), tag, tag, iid))
+     con.commit()
+     return dest
+ 
+--- a/art-radar/server.py
++++ b/art-radar/server.py
+@@ -4,7 +4,8 @@
+ 
+     python server.py [--port 8765] [--open]
+ 
+-只监听 127.0.0.1，不对外网开放。
++默认监听 0.0.0.0，手机才能在局域网连上；本机（Host 为 localhost/127.0.0.1）免令牌，
++其它来源必须带配对令牌，图片也一样。
+ """
+ from __future__ import annotations
+ 
+@@ -16,8 +17,10 @@
+ import secrets
+ import socket
+ import sqlite3
++import subprocess
+ import sys
+ import threading
++import time
+ import traceback
+ import urllib.parse
+ import webbrowser
+@@ -64,7 +67,7 @@
+ MORE_JOB = {"state": "idle", "added": 0, "filtered": 0, "keywords": [], "error": "", "mode": "auto",
+             "limit": 10, "platform": "all"}
+ ACCEPT_LOCK = threading.Lock()
+-ACCEPT_JOB = {"state": "idle", "total": 0, "done": 0, "added": 0, "error": ""}
++ACCEPT_JOB = {"state": "idle", "total": 0, "done": 0, "added": 0, "low_res": 0, "error": ""}
+ 
+ 
+ def connect() -> sqlite3.Connection:
+@@ -86,7 +89,7 @@
+ 
+ 
+ def save_following(data: dict) -> None:
+-    FOLLOW_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
++    core.atomic_write(FOLLOW_FILE, json.dumps(data, ensure_ascii=False, indent=2))
+ 
+ 
+ def following_stats(con: sqlite3.Connection) -> list[dict]:
+@@ -124,15 +127,14 @@
+             continue
+         if d.name not in out:
+             out.append(d.name)
+-    for d in sorted(root.rglob("*")):
+-        if not d.is_dir():
++    for top in sorted(root.iterdir()):
++        if not top.is_dir() or top.name in (".artradar", "00_inbox"):
+             continue
+-        rel = d.relative_to(root)
+-        if len(rel.parts) != 2 or rel.parts[0] in (".artradar", "00_inbox"):
+-            continue
+-        name = "/".join(rel.parts)
+-        if name not in out:
+-            out.append(name)
++        for d in sorted(top.iterdir()):
++            if d.is_dir():
++                name = f"{top.name}/{d.name}"
++                if name not in out:
++                    out.append(name)
+     artists_root = root / CFG["filing"]["artists_dir"]
+     if artists_root.exists():
+         for d in sorted(artists_root.iterdir()):
+@@ -143,8 +145,61 @@
+     return out
+ 
+ 
++_TOTAL_CACHE = {"at": 0.0, "n": 0}
++
++
++def library_total() -> int:
++    # 只有旧页面还用这个数字。全盘遍历很慢，放后台算、缓存一分钟，不能拖慢 /api/state（启动器探活只等 1.5 秒）
++    def count():
++        exts = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
++        _TOTAL_CACHE["n"] = sum(1 for p in CFG["_root"].rglob("*")
++                                if p.suffix.lower() in exts and p.is_file()
++                                and ".artradar" not in p.parts)
++
++    if time.time() - _TOTAL_CACHE["at"] > 60:
++        _TOTAL_CACHE["at"] = time.time()
++        threading.Thread(target=count, daemon=True).start()
++    return _TOTAL_CACHE["n"]
++
++
++def reveal(target: Path) -> None:
++    if sys.platform != "win32":
++        raise RuntimeError("只支持在 Windows 上打开文件夹")
++    arg = f"/select,{target}" if target.is_file() else str(target)
++    subprocess.Popen(["explorer", arg])  # noqa: S603,S607
++
++
++def migrate_followed() -> None:
++    # 补上更新前就关注的画师，以及 CLI、定时任务归档的图
++    con = connect()
++    try:
++        for name in load_following().get("artists", {}):
++            moved = core.migrate_artist(CFG, con, name)
++            if moved:
++                print(f"已把 {name} 的 {moved} 张图整理到画师文件夹", flush=True)
++    except Exception:  # noqa: BLE001
++        traceback.print_exc()
++    finally:
++        con.close()
++
++
++def is_low_res(con: sqlite3.Connection, iid) -> bool:
++    row = con.execute("SELECT note FROM items WHERE id=?", (str(iid),)).fetchone()
++    return bool(row and row["note"] == core.LOW_RES_NOTE)
++
++
++def use_artist_folder(row, data: dict) -> bool:
++    name = (row["artist"] or "").strip() if row else ""
++    if not name:
++        return False
++    return bool(data.get("artist") or data.get("smart")
++                or (data.get("by_follow") and name in load_following().get("artists", {})))
++
++
+ def item_json(row: sqlite3.Row) -> dict:
+     d = dict(row)
++    if d.get("source") == "pinterest":
++        d["title"] = core.clean_pin_title(d.get("title") or "")
+     d["suggested"] = core.guess_category(d)
+     d["manual_tags"] = [t for t in (d.get("tags_manual") or "").split(",") if t.strip()]
+     d["thumb_url"] = f'/img/thumb/{d["id"]}'
+@@ -160,7 +215,7 @@
+ def list_items(status: str, q: str = "") -> list[dict]:
+     con = connect()
+     order = "decided_at DESC" if status != "pending" else "score DESC, created_at DESC"
+-    rows = con.execute(f"SELECT * FROM items WHERE status=? ORDER BY {order} LIMIT 500",
++    rows = con.execute(f"SELECT * FROM items WHERE status=? ORDER BY {order}",
+                        (status,)).fetchall()
+     con.close()
+     items = [item_json(r) for r in rows]
+@@ -190,14 +245,30 @@
+     def _json(self, obj, code: int = 200):
+         self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+ 
++    def _host_name(self) -> str:
++        host = self.headers.get("Host") or ""
++        return urllib.parse.urlsplit("//" + host).hostname or ""
++
+     def _authorized(self) -> bool:
+-        if self.client_address[0] in ("127.0.0.1", "::1"):
+-            return True
+         supplied = self.headers.get("X-Art-Token") or ""
+         if not supplied:
+             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+             supplied = (qs.get("token") or [""])[0]
+-        return supplied == TOKEN
++        if secrets.compare_digest(supplied.encode("utf-8"), TOKEN.encode("utf-8")):
++            return True
++        # 本机免令牌，但要看 Host：挡住 DNS 重绑定把恶意网站指到 127.0.0.1
++        return self._is_local()
++
++    def _is_local(self) -> bool:
++        return (self.client_address[0] in ("127.0.0.1", "::1")
++                and self._host_name() in ("127.0.0.1", "localhost", "::1"))
++
++    def _same_origin(self) -> bool:
++        # 挡住别的网页往本地服务发 POST（比如偷偷调 /api/delete）
++        origin = self.headers.get("Origin")
++        if not origin:
++            return True
++        return origin != "null" and urllib.parse.urlsplit(origin).hostname == self._host_name()
+ 
+     def _body(self) -> dict:
+         length = int(self.headers.get("Content-Length") or 0)
+@@ -238,7 +309,7 @@
+     def do_GET(self):  # noqa: N802
+         parsed = urllib.parse.urlparse(self.path)
+         path = parsed.path
+-        if not path.startswith("/img/") and not self._authorized():
++        if not self._authorized():
+             self._send(401, b"ArtRadar: unauthorized (need token)", "text/plain; charset=utf-8")
+             return
+         try:
+@@ -255,12 +326,10 @@
+                           con.execute("SELECT status, COUNT(*) n FROM items GROUP BY status")}
+                 following = following_stats(con)
+                 con.close()
+-                total = sum(1 for p in CFG["_root"].rglob("*")
+-                            if p.is_file() and p.suffix.lower() in
+-                            {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+-                            and ".artradar" not in p.parts)
+                 self._json({"counts": counts, "categories": categories(),
+-                            "library_total": total, "following": following,
++                            "library_total": library_total(), "following": following,
++                            "artists_dir_name": CFG["filing"]["artists_dir"],
++                            "local": self._is_local(),
+                             "root": str(CFG["_root"]),
+                             "artists_dir": str(CFG["_root"] / CFG["filing"]["artists_dir"])})
+                 return
+@@ -304,7 +373,7 @@
+ 
+     def do_POST(self):  # noqa: N802
+         path = urllib.parse.urlparse(self.path).path
+-        if not self._authorized():
++        if not self._authorized() or not self._same_origin():
+             self._json({"ok": False, "error": "unauthorized"}, 401)
+             return
+         if path == "/api/upload":
+@@ -329,7 +398,7 @@
+                     platform = "all"
+                 mode = platform if platform != "all" else core.detect_mode(raw)
+                 with MORE_LOCK:
+-                    if MORE_JOB["state"] == "running":
++                    if MORE_JOB["state"] in ("running", "cancelling"):
+                         con.close()
+                         self._json({"ok": False, "error": "正在抓取，稍等一下"}, 409)
+                         return
+@@ -375,8 +444,6 @@
+                 ids = data.get("ids") or []
+                 category = (data.get("category") or "").strip() or None
+                 note = data.get("note") or ""
+-                artist = bool(data.get("artist"))
+-                smart = bool(data.get("smart"))
+                 if data.get("async"):
+                     with ACCEPT_LOCK:
+                         if ACCEPT_JOB["state"] == "running":
+@@ -384,7 +451,7 @@
+                             self._json({"ok": False, "error": "上一批还在归档，稍等一下"}, 409)
+                             return
+                         ACCEPT_JOB.update(state="running", total=len(ids), done=0,
+-                                          added=0, error="")
++                                          added=0, low_res=0, error="")
+ 
+                     def run_accept():
+                         job_con = connect()
+@@ -394,14 +461,15 @@
+                                 try:
+                                     row = job_con.execute(
+                                         "SELECT artist FROM items WHERE id=?", (str(iid),)).fetchone()
+-                                    use_artist = artist or (smart and bool(
+-                                        row and (row["artist"] or "").strip()))
++                                    use_artist = use_artist_folder(row, data)
+                                     dest = core.file_item(
+                                         CFG, job_con, str(iid),
+                                         tags=[category] if category else None,
+                                         note=note, artist=use_artist)
+                                     if dest:
+                                         added += 1
++                                        if is_low_res(job_con, iid):
++                                            ACCEPT_JOB["low_res"] += 1
+                                 except Exception:  # noqa: BLE001
+                                     traceback.print_exc()
+                                 with ACCEPT_LOCK:
+@@ -424,11 +492,12 @@
+                 for iid in ids:
+                     try:
+                         row = con.execute("SELECT artist FROM items WHERE id=?", (str(iid),)).fetchone()
+-                        use_artist = artist or (smart and bool(row and (row["artist"] or "").strip()))
++                        use_artist = use_artist_folder(row, data)
+                         dest = core.file_item(CFG, con, str(iid),
+                                               tags=[category] if category else None,
+                                               note=note, artist=use_artist)
+-                        results.append({"id": iid, "ok": bool(dest), "path": str(dest) if dest else ""})
++                        results.append({"id": iid, "ok": bool(dest), "path": str(dest) if dest else "",
++                                        "low_res": is_low_res(con, iid)})
+                     except Exception as exc:  # noqa: BLE001
+                         results.append({"id": iid, "ok": False, "error": str(exc)})
+                 con.close()
+@@ -438,8 +507,12 @@
+                 ids = data.get("ids") or []
+                 reason = data.get("reason") or ""
+                 for iid in ids:
+-                    con.execute("UPDATE items SET status='rejected', note=?, decided_at=? WHERE id=?",
+-                                (reason, core.iso(core.now_utc()), str(iid)))
++                    row = con.execute("SELECT status FROM items WHERE id=?", (str(iid),)).fetchone()
++                    if row and row["status"] == "kept":
++                        core.unfile_item(CFG, con, str(iid), "rejected", reason)
++                    else:
++                        con.execute("UPDATE items SET status='rejected', note=?, decided_at=? WHERE id=?",
++                                    (reason, core.iso(core.now_utc()), str(iid)))
+                 con.commit()
+                 con.close()
+                 self._json({"ok": True})
+@@ -458,13 +531,34 @@
+                     else:
+                         artists.pop(artist, None)
+                     save_following(fd)
++                # 关注时把已收藏的图归到画师文件夹；取关不搬回去，App 里照样能看到
++                moved = core.migrate_artist(CFG, con, artist) if data.get("follow") else 0
+                 stats = following_stats(con)
+                 con.close()
+-                self._json({"ok": True, "following": stats})
++                self._json({"ok": True, "following": stats, "moved": moved})
++                return
++            if path == "/api/reveal":
++                # 在电脑上弹资源管理器，只给本机页面用；手机连上来时没有意义
++                if not self._is_local():
++                    con.close()
++                    self._json({"ok": False, "error": "只能在电脑上打开文件夹"}, 403)
++                    return
++                target = CFG["_root"]
++                if data.get("id"):
++                    row = con.execute("SELECT filed_path FROM items WHERE id=?", (str(data["id"]),)).fetchone()
++                    target = Path(row["filed_path"]) if row and row["filed_path"] else None
++                con.close()
++                if not target or not target.exists():
++                    self._json({"ok": False, "error": "文件不在了"}, 404)
++                    return
++                reveal(target)
++                self._json({"ok": True})
+                 return
+             if path == "/api/tag":
+                 ids = data.get("ids") or []
+-                tags = [str(t).strip() for t in (data.get("tags") or []) if str(t).strip()]
++                tags = list(dict.fromkeys(str(t).strip() for t in (data.get("tags") or []) if str(t).strip()))
++                for t in tags:
++                    core.check_tag(t)
+                 add = bool(data.get("add", True))
+                 mode = str(data.get("mode") or ("add" if add else "remove"))
+                 out_items = []
+@@ -472,16 +566,19 @@
+                     row = con.execute("SELECT * FROM items WHERE id=?", (str(iid),)).fetchone()
+                     if not row:
+                         continue
+-                    manual = {t for t in (row["tags_manual"] or "").split(",") if t.strip()}
++                    manual = core.split_tags(row["tags_manual"])
+                     if mode == "replace":
+-                        manual = set(tags)
++                        manual = tags
+                     elif mode == "remove":
+-                        manual.difference_update(tags)
++                        manual = [t for t in manual if t not in tags]
+                     else:
+-                        manual.update(tags)
+-                    joined = ",".join(sorted(manual))
+-                    con.execute("UPDATE items SET tags_manual=?, tags=? WHERE id=?",
+-                                (joined, joined, str(iid)))
++                        manual = list(dict.fromkeys(manual + tags))
++                    if row["status"] == "kept" and row["filed_path"]:
++                        core.retag_kept(CFG, con, str(iid), manual)
++                    else:
++                        # tags 列留给 AI 猜分类用；改过分类就不再放回取消收藏前的文件夹
++                        con.execute("UPDATE items SET tags_manual=?, folder=NULL WHERE id=?",
++                                    (",".join(manual), str(iid)))
+                     out_items.append(item_json(con.execute(
+                         "SELECT * FROM items WHERE id=?", (str(iid),)).fetchone()))
+                 con.commit()
+@@ -490,7 +587,11 @@
+                 return
+             if path == "/api/restore":
+                 for iid in data.get("ids") or []:
+-                    con.execute("UPDATE items SET status='pending', note='' WHERE id=?", (str(iid),))
++                    row = con.execute("SELECT status FROM items WHERE id=?", (str(iid),)).fetchone()
++                    if row and row["status"] == "kept":
++                        core.unfile_item(CFG, con, str(iid))
++                    else:
++                        con.execute("UPDATE items SET status='pending', note='' WHERE id=?", (str(iid),))
+                 con.commit()
+                 con.close()
+                 self._json({"ok": True})
+@@ -1079,6 +1180,7 @@
+     pair = f"http://{lan_ip()}:{args.port}/?token={TOKEN}"
+     print(f"art-radar UI: {url}", flush=True)
+     print(f"手机端配对: {pair}", flush=True)
++    threading.Thread(target=migrate_followed, daemon=True).start()
+     if args.open:
+         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+     server.serve_forever()
+--- a/art-radar/ui.html
++++ b/art-radar/ui.html
+@@ -7,279 +7,272 @@
+ <style>
+ :root{color-scheme:dark;--bg:#131210;--raise:#1c1b18;--raise2:#25241f;--line:#2e2c27;
+   --text:#ece7dc;--sub:#a39d90;--mute:#6f6a60;--ac:#6c5cf5;--ac-t:#9b8fff;
+-  --ac-soft:rgba(108,92,245,.16);--danger:#e08b92;--ok:#8fbf9a;
+-  --serif:Georgia,"Times New Roman","Noto Serif SC",serif}
+-*{box-sizing:border-box}
+-html,body{margin:0;background:var(--bg);color:var(--text);
+-  font-family:"Avenir Next","Segoe UI","Noto Sans SC","Microsoft YaHei",sans-serif}
++  --ac-soft:rgba(108,92,245,.16);--danger:#e0806e;
++  --serif:"Iowan Old Style","Palatino Linotype",Georgia,"Noto Serif SC","Songti SC",serif}
++*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
++html,body{margin:0;background:var(--bg);color:var(--text);font-size:14px;
++  font-family:-apple-system,"PingFang SC","Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif}
+ body{padding-bottom:90px}
+ button,input,select{font:inherit}
+-button{border:0;background:none;color:inherit;cursor:pointer}
++button{border:0;background:none;color:inherit;cursor:pointer;padding:0}
+ img{display:block}
+-header{position:sticky;top:0;z-index:30;background:rgba(19,18,16,.96);
+-  backdrop-filter:blur(10px);padding:14px 18px 0;max-width:1500px;margin:0 auto}
+-.topbar{display:flex;align-items:center;justify-content:space-between;gap:10px}
+-h1{font-family:var(--serif);font-weight:400;font-size:34px;line-height:1;margin:0;letter-spacing:-.02em}
++svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
++header{position:sticky;top:0;z-index:30;background:rgba(19,18,16,.94);
++  backdrop-filter:blur(14px);padding:18px 18px 0;max-width:1500px;margin:0 auto}
++.topbar{display:flex;align-items:center;justify-content:space-between;gap:10px;height:36px;margin-right:-8px}
++h1{font-family:var(--serif);font-weight:400;font-size:26px;line-height:1;margin:0;letter-spacing:-.2px}
+ h1 span{color:var(--ac-t)}
+ .icons{display:flex;gap:2px}
+-.icon{width:38px;height:38px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+-  color:var(--sub);font-size:20px;transition:.15s}
+-.icon:hover{background:var(--raise);color:var(--text)}
++.icon{width:36px;height:36px;border-radius:10px;display:grid;place-items:center;color:var(--sub)}
++.icon:hover{color:var(--text)}
++.icon:active{background:var(--raise)}
+ .icon.on{color:var(--ac-t)}
+-.statline{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:8px 0 10px;
+-  font-size:12px;color:var(--sub)}
++.icon.spin svg{animation:spin .7s ease}
++.statline{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:8px;height:28px;
++  font-size:12px;color:var(--mute)}
+ .libcount{cursor:pointer;white-space:nowrap}
+-.libcount b{font-family:var(--serif);font-size:19px;color:var(--text);font-weight:400;margin-right:3px}
++.libcount b{font-family:var(--serif);font-size:17px;color:var(--sub);font-weight:400;margin-right:4px;font-variant-numeric:tabular-nums}
+ .followwrap{display:flex;align-items:center;gap:8px;min-width:0;cursor:pointer}
+-.newtext{white-space:nowrap;color:var(--sub);font-size:11.5px}
++.newtext{white-space:nowrap}
+ .newtext.hot{color:var(--ac-t)}
+ .avatars{display:flex}
+-.avatar{position:relative;width:29px;height:29px;border-radius:50%;margin-left:-7px;border:2px solid var(--bg);
+-  background:var(--raise2);display:flex;align-items:center;justify-content:center;font-size:10px;flex:none;overflow:visible}
++.avatar{position:relative;width:24px;height:24px;border-radius:50%;margin-left:-7px;box-shadow:0 0 0 2px var(--bg);
++  background:var(--raise2);color:var(--sub);display:grid;place-items:center;font-size:11px;font-weight:600;flex:none}
+ .avatar:first-child{margin-left:0}
+-.avatar img{width:100%;height:100%;border-radius:50%;object-fit:cover}
+-.avatar .nd{position:absolute;right:-1px;top:-1px;width:8px;height:8px;border-radius:50%;
+-  background:var(--ac-t);border:1.5px solid var(--bg)}
+-.avatar.more{font-size:9px;color:var(--sub)}
+-.ai{display:none;margin:2px 0 8px}
++.avatar img{position:absolute;inset:0;width:100%;height:100%;border-radius:50%;object-fit:cover}
++.avatar .nd{position:absolute;right:-1px;top:-1px;width:7px;height:7px;border-radius:50%;
++  background:var(--ac-t);box-shadow:0 0 0 2px var(--bg)}
++.ai{display:none}
+ .ai.open{display:block}
+-.aiinput{display:flex;align-items:center;background:var(--raise);border-radius:11px;padding:4px 5px 4px 12px}
+-.aiinput input{flex:1;background:none;border:0;outline:none;color:var(--text);padding:8px 0;font-size:14px;min-width:50px}
+-.aiinput .div{height:20px;width:1px;background:var(--line);margin:0 8px}
+-.aiinput .num{width:36px;text-align:right;background:none;border:0;outline:none;color:var(--text);font-size:14px;padding:0}
+-.aiinput .unit{color:var(--mute);font-size:11px;margin:0 4px}
+-.enter{width:38px;height:38px;border-radius:8px;background:var(--ac);color:#fff;font-size:19px;flex:none}
++.aiinput{margin-top:12px;display:flex;align-items:center;height:48px;background:var(--raise);border-radius:14px;
++  padding-left:16px;box-shadow:inset 0 0 0 1px var(--line);transition:box-shadow .15s}
++.aiinput:focus-within{box-shadow:inset 0 0 0 1px var(--ac)}
++.aiinput input{background:none;border:0;outline:none;color:var(--text);font-size:15px;min-width:0}
++.aiinput #kw{flex:1}
++.aiinput #kw::placeholder{color:var(--mute)}
++.aiinput .div{flex:none;height:20px;width:1px;background:var(--line);margin:0 4px 0 10px}
++.aiinput .num{flex:none;width:40px;text-align:center;color:var(--sub);font-variant-numeric:tabular-nums;-moz-appearance:textfield}
++.aiinput .num::-webkit-inner-spin-button{display:none}
++.enter{flex:none;width:38px;height:38px;margin-right:5px;border-radius:10px;background:var(--ac);color:#fff;display:grid;place-items:center}
++.enter svg{width:18px;height:18px;stroke-width:2.2}
+ .enter:disabled{opacity:.5}
+-.aihint{color:var(--mute);font-size:11px;margin:5px 2px 0;min-height:14px}
+-.aicancel{display:none;color:var(--danger);font-size:11px;margin:3px 2px 0}
+-.aiQuick{display:none;flex-wrap:wrap;gap:6px;align-items:center;margin:5px 2px 0;font-size:11px;color:var(--mute)}
++.aihint{color:var(--mute);font-size:12px;margin:8px 2px 0}
++.aihint:empty{display:none}
++.aicancel{display:none;color:var(--danger);font-size:12px;margin:6px 2px 0}
++.aiQuick{display:none;gap:12px;align-items:center;overflow-x:auto;scrollbar-width:none;margin:10px 2px 0;font-size:13px;color:var(--mute)}
++.aiQuick::-webkit-scrollbar{display:none}
+ .aiQuick.show{display:flex}
+-.aiQuick button{color:var(--ac-t);font-size:11px;padding:2px 0}
+-.aiQuick .sep{color:var(--mute);margin-left:6px}
+-.platforms{display:flex;gap:16px;overflow-x:auto;scrollbar-width:none;margin:8px 2px 0}
++.aiQuick button{color:var(--ac-t);white-space:nowrap}
++.aiQuick [data-manage]{color:var(--mute)}
++.platforms{display:flex;gap:16px;overflow-x:auto;scrollbar-width:none;margin:12px 2px 0;font-size:13px}
+ .platforms::-webkit-scrollbar{display:none}
+-.platforms button{display:flex;align-items:center;gap:6px;color:var(--sub);font-size:12px;white-space:nowrap}
++.platforms button{color:var(--mute);white-space:nowrap}
+ .platforms button.on{color:var(--text)}
+-.platforms i{width:5px;height:5px;border-radius:50%;background:transparent}
+-.platforms button.on i{background:var(--ac-t)}
+-.tabrow{display:flex;align-items:center;gap:12px;position:relative;padding:2px 0 0}
+-.filterbtn{display:flex;align-items:center;gap:4px;color:var(--sub);font-size:12px;padding:8px 0;white-space:nowrap}
+-.filterbtn.hot{color:var(--ac-t)}
+-.filterbtn b{min-width:15px;height:15px;border-radius:8px;background:var(--ac);color:#fff;font-size:9px;
+-  display:flex;align-items:center;justify-content:center}
++.platforms i{display:none}
++.platforms button.on i{display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--ac);margin-right:6px;vertical-align:2px}
++.tabrow{display:flex;align-items:center;gap:14px;margin-top:10px;border-bottom:1px solid var(--line);min-height:42px}
++.filterbtn{position:relative;flex:none;display:grid;place-items:center;width:30px;height:30px;margin-left:-6px;border-radius:8px;color:var(--mute)}
++.filterbtn svg{width:18px;height:18px}
++.filterbtn.hot{color:var(--ac-t);background:var(--ac-soft)}
++.filterbtn b{position:absolute;top:-3px;right:-4px;min-width:15px;height:15px;padding:0 4px;border-radius:8px;
++  background:var(--ac);color:#fff;font-size:10px;font-weight:400;line-height:15px;text-align:center}
+ .filterbtn b[hidden]{display:none}
+-.tabs{display:flex;gap:16px;flex:1;overflow-x:auto;scrollbar-width:none}
++.tabs{display:flex;gap:20px;flex:1;min-width:0;overflow-x:auto;scrollbar-width:none}
+ .tabs::-webkit-scrollbar{display:none}
+-.tabs button{color:var(--mute);font-size:13px;padding:8px 0 9px;position:relative;white-space:nowrap}
++.tabs button{color:var(--mute);padding:10px 0 11px;position:relative;white-space:nowrap}
+ .tabs button.on{color:var(--text)}
+-.tabs button.on::after{content:"";position:absolute;left:0;right:0;bottom:0;height:2px;background:var(--ac-t)}
+-.tabs .n{font-size:10px;color:var(--mute);margin-left:3px}
+-.selectall{color:var(--mute);font-size:11px;white-space:nowrap}
+-.searchicon{color:var(--sub);font-size:19px;padding:3px}
+-.localsearch{display:none;align-items:center;gap:8px;width:100%}
+-.localsearch input{flex:1;background:var(--raise);border:0;border-radius:9px;color:var(--text);
+-  padding:9px 12px;outline:none;min-width:0}
+-.localsearch button{color:var(--ac-t);font-size:12px;white-space:nowrap}
+-.tabrow.searching .filterbtn,.tabrow.searching .tabs,.tabrow.searching .selectall,
+-.tabrow.searching .searchicon{display:none}
++.tabs button.on::after{content:"";position:absolute;left:0;right:0;bottom:0;height:2px;background:var(--ac);border-radius:2px}
++.tabs .n{font-size:12px;margin-left:4px;font-variant-numeric:tabular-nums}
++.searchicon{flex:none;display:grid;place-items:center;width:30px;height:30px;margin-right:-6px;color:var(--mute)}
++.searchicon svg{width:17px;height:17px}
++.localsearch{display:none;align-items:center;gap:8px;width:100%;min-height:41px}
++.localsearch svg{flex:none;width:17px;height:17px;color:var(--ac-t)}
++.localsearch input{flex:1;background:none;border:0;color:var(--text);outline:none;min-width:0}
++.localsearch input::placeholder{color:var(--mute)}
++.localsearch button{flex:none;color:var(--sub);padding:6px 0 6px 6px}
++.tabrow.searching{border-bottom-color:var(--ac)}
++.tabrow.searching .filterbtn,.tabrow.searching .tabs,.tabrow.searching .searchicon{display:none}
+ .tabrow.searching .localsearch{display:flex}
+-.catquick{display:flex;gap:16px;overflow-x:auto;scrollbar-width:none;padding:7px 0 8px;margin-top:2px}
++.catquick{display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;margin:0 -18px;padding:12px 18px 10px;align-items:center}
+ .catquick::-webkit-scrollbar{display:none}
+-.catquick button{color:var(--mute);font-size:11.5px;white-space:nowrap}
+-.catquick button.on{color:var(--ac-t)}
+-.catquick button .n{font-size:9.5px;color:var(--mute);margin-left:3px}
+-.catquick .mode{color:var(--mute);font-size:10px;white-space:nowrap}
+-.activefilters{display:flex;flex-wrap:wrap;gap:5px;padding:0 0 8px}
++.catquick button{flex:none;height:30px;padding:0 11px;border-radius:15px;font-size:13px;color:var(--sub);background:var(--raise);white-space:nowrap}
++.catquick button .n{font-size:11px;color:var(--mute);margin-left:3px;font-variant-numeric:tabular-nums}
++.catquick button.on,.catquick button.on .n{background:var(--ac-soft);color:var(--ac-t)}
++.catquick button.on .n{background:none}
++.catquick .mode{flex:none;color:var(--mute);font-size:11px;padding-left:4px;white-space:nowrap}
++.activefilters{display:flex;flex-wrap:wrap;gap:6px;padding:0 0 10px}
+ .activefilters:empty{display:none}
+-.ftag{display:flex;align-items:center;gap:5px;background:var(--ac-soft);color:var(--ac-t);
+-  border-radius:6px;padding:3px 7px;font-size:10.5px}
+-.ftag button{color:var(--ac-t);font-size:13px;line-height:1}
++.ftag{display:flex;align-items:center;gap:5px;height:28px;background:var(--ac-soft);color:var(--ac-t);
++  border-radius:8px;padding:0 9px;font-size:12.5px}
++.ftag.plain{background:none;box-shadow:inset 0 0 0 1px var(--line);color:var(--sub)}
++.ftag button{color:inherit;line-height:1}
+ main{max-width:1500px;margin:0 auto;padding:6px 18px 20px}
+-.grid{column-width:270px;column-gap:18px}
+-.card{break-inside:avoid;margin:0 0 18px;position:relative;min-width:0;user-select:none}
+-.photo{position:relative;border-radius:10px;overflow:hidden;background:var(--raise);cursor:zoom-in}
+-.photo img{width:100%;height:auto;display:block}
+-.card.selected .photo{outline:2px solid var(--ac-t);outline-offset:3px}
+-.body{padding:7px 1px 0;position:relative}
+-.artistline{display:flex;align-items:center;gap:5px;min-width:0}
+-.artist{font-size:12.5px;font-weight:600;color:var(--text);padding:0;max-width:100%;overflow:hidden;
+-  text-overflow:ellipsis;white-space:nowrap;text-align:left}
+-.artist.pressed{color:var(--ac-t);transform:scale(.96)}
+-.artist.followed::after{content:"";width:5px;height:5px;border-radius:50%;background:var(--ac-t);
++.grid{column-width:230px;column-gap:18px}
++.card{break-inside:avoid;margin:0 0 22px;position:relative;min-width:0;user-select:none;-webkit-user-select:none}
++.card.gone{opacity:0;transform:translateY(6px);transition:opacity .18s,transform .18s}
++.photo{position:relative;border-radius:10px;background:var(--raise);cursor:zoom-in;outline:2px solid transparent;outline-offset:3px;transition:outline-color .15s}
++.photo img{width:100%;height:100%;display:block;border-radius:10px}
++.card.selected .photo{outline-color:var(--ac)}
++.body{padding:6px 2px 0;cursor:pointer}
++.head{display:flex;align-items:center;margin-right:-6px;min-height:28px}
++.artist{flex:1;min-width:0;font-size:14px;font-weight:600;color:var(--text);text-align:left;overflow:hidden;
++  text-overflow:ellipsis;white-space:nowrap;-webkit-touch-callout:none;transition:color .15s}
++.artist.none{color:var(--mute);font-weight:400}
++.artist.pressed{color:var(--ac-t)}
++.artist.followed::after{content:"";width:6px;height:6px;border-radius:50%;background:var(--ac);
+   display:inline-block;margin-left:5px;vertical-align:middle}
+-.multicount{margin-left:auto;color:var(--mute);font-size:9.5px;white-space:nowrap}
+-.title{color:var(--sub);font-size:11.5px;line-height:1.45;margin-top:2px;overflow:hidden;
+-  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;cursor:pointer}
+-.catline{display:block;text-align:left;color:var(--sub);font-size:10.5px;margin-top:5px;
+-  max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:0;cursor:pointer}
+-.catline.ai{color:var(--mute);border-bottom:1px dashed #8a7e70;display:inline-block;max-width:100%}
+-.catline .caret{font-size:9px;color:var(--mute);margin-left:2px}
+-.cardbar{display:flex;justify-content:flex-end;align-items:center;gap:1px;margin-top:1px}
+-.cardbar button{color:var(--mute);width:28px;height:27px;padding:0;display:flex;align-items:center;
+-  justify-content:center;border-radius:7px;transition:color .18s,background .18s,transform .12s,opacity .18s}
+-.cardbar button svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.7;
+-  stroke-linecap:round;stroke-linejoin:round;transition:transform .18s}
+-.cardbar button:hover{background:var(--raise);color:var(--ac-t)}
+-.cardbar button:hover svg{transform:translateY(-1px) scale(1.06)}
+-.cardbar button:active{transform:scale(.82)}
+-.cardbar .star{color:var(--ac-t)}
+-.cardbar .person{color:var(--sub)}
+-.cardbar .no{color:var(--danger)}
+-.cardbar .del{color:#b9827f}
+-.cardbar button.off{opacity:.25}
+-.cardbar .more{color:var(--mute)}
+-.selcircle{display:none;position:absolute;right:2px;top:2px;width:21px;height:21px;border-radius:50%;
+-  border:1.5px solid var(--mute);background:rgba(19,18,16,.55);z-index:3}
+-body.selecting .selcircle{display:block}
++.title{color:var(--sub);font-size:12.5px;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
++.foot{display:flex;align-items:center;gap:8px;margin-top:4px}
++.catline{min-width:0;display:flex;align-items:center;gap:1px;text-align:left;color:var(--sub);font-size:12px;padding:3px 0}
++.catline span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
++.catline svg{flex:none;width:12px;height:12px;color:var(--mute)}
++.catline.ai{color:var(--mute)}
++.catline.ai span{text-decoration:underline dashed rgba(163,157,144,.6);text-underline-offset:3px}
++.multicount{flex:none;margin-left:auto;color:var(--mute);font-size:11px;white-space:nowrap;font-variant-numeric:tabular-nums}
++.cardbar{flex:none;display:flex;align-items:center}
++.cardbar button{color:var(--mute);width:28px;height:28px;display:grid;place-items:center;border-radius:8px}
++.cardbar button:active{background:var(--raise)}
++.cardbar svg{width:18px;height:18px}
++.cardbar .star.on{color:var(--ac-t)}
++.cardbar .star.on svg{fill:var(--ac-t)}
++.selcircle{display:none;flex:none;width:20px;height:20px;margin:4px 10px 4px 4px;border-radius:50%;
++  box-shadow:inset 0 0 0 1.5px var(--mute);color:transparent;place-items:center}
++.selcircle svg{width:12px;height:12px;stroke-width:3}
++body.selecting .selcircle{display:grid}
+ body.selecting .cardbar{display:none}
+-body.selecting .catline{pointer-events:none}
+-body.selecting .artist{pointer-events:none}
++body.selecting .catline svg{display:none}
++body.selecting .catline,body.selecting .artist{pointer-events:none}
+ body.selecting .photo{cursor:pointer}
+-.card.selected .selcircle{background:var(--ac);border-color:var(--ac)}
+-.card.selected .selcircle::after{content:"✓";color:#fff;font-size:12px;display:flex;align-items:center;
+-  justify-content:center;width:100%;height:100%}
+-.empty{column-span:all;text-align:center;color:var(--mute);padding:55px 10px;font-size:12px}
+-.empty button{color:var(--ac-t);margin-top:10px;font-size:12px}
+-.batch{position:fixed;left:50%;bottom:14px;transform:translateX(-50%) translateY(140%);z-index:40;
+-  display:flex;gap:6px;align-items:center;background:var(--raise2);border-radius:14px;padding:7px 9px;
+-  box-shadow:0 14px 42px rgba(0,0,0,.55);transition:.2s;max-width:96vw;overflow-x:auto}
++.card.selected .selcircle{background:var(--ac);box-shadow:none;color:#fff}
++.empty{column-span:all;text-align:center;color:var(--mute);padding:80px 10px;font-family:var(--serif);font-size:16px}
++.empty button{display:block;margin:16px auto 0;height:32px;padding:0 12px;border-radius:8px;background:var(--ac-soft);color:var(--ac-t);
++  font-family:-apple-system,"Microsoft YaHei",sans-serif;font-size:13px}
++.batch{position:fixed;left:50%;bottom:18px;transform:translateX(-50%) translateY(160%);z-index:40;
++  width:calc(min(440px,100vw) - 28px);display:flex;gap:2px;align-items:center;background:var(--raise2);border-radius:16px;
++  padding:6px 6px 6px 14px;box-shadow:0 0 0 1px var(--line),0 16px 40px rgba(0,0,0,.5)}
+ .batch.show{transform:translateX(-50%) translateY(0)}
+-.batch .n{color:var(--ac-t);font-size:11px;white-space:nowrap;padding:0 4px}
+-.batch button{background:var(--raise);color:var(--text);border-radius:7px;padding:7px 9px;font-size:11px;white-space:nowrap}
+-.batch .primary{background:var(--ac);color:#fff}
+-.batch .danger{color:var(--danger)}
+-.sheet{position:fixed;inset:0;background:rgba(0,0,0,.62);z-index:60;display:none;align-items:flex-end;justify-content:center}
+-.sheet.show{display:flex}
+-.box{background:var(--raise2);border-radius:18px 18px 0 0;width:min(700px,100%);max-height:84vh;overflow:auto;
+-  padding:18px 18px calc(20px + env(safe-area-inset-bottom))}
+-.box h2{font-family:var(--serif);font-weight:400;font-size:21px;margin:0 0 3px}
+-.box .sub{color:var(--mute);font-size:11px;margin-bottom:14px}
+-.box h3{color:var(--sub);font-size:11px;font-weight:500;margin:16px 0 7px;letter-spacing:.03em}
+-.frow{display:flex;flex-wrap:wrap;gap:6px}
+-.fopt{background:var(--raise);color:var(--sub);border-radius:7px;padding:6px 8px;font-size:11px}
+-.fopt.on{background:var(--ac-soft);color:var(--ac-t)}
+-.fopt:disabled{opacity:.35}
+-.fopt .c{color:var(--mute);font-size:9.5px;margin-left:4px}
+-.seg{display:flex;gap:5px;margin-bottom:6px}
+-.seg button{background:var(--raise);color:var(--sub);border-radius:6px;padding:4px 8px;font-size:10px}
+-.seg button.on{background:var(--ac-soft);color:var(--ac-t)}
+-.fsort{width:100%;background:var(--raise);border:0;border-radius:8px;color:var(--text);padding:8px 9px;outline:none}
+-.sheet-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
+-.sheet-actions button{background:var(--raise);color:var(--text);border-radius:8px;padding:8px 12px;font-size:11px}
+-.sheet-actions .primary{background:var(--ac);color:#fff}
+-.sheet-actions .danger{color:var(--danger)}
+-.menurow{display:flex;align-items:center;justify-content:space-between;width:100%;padding:11px 1px;
+-  border-bottom:1px solid var(--line);font-size:12.5px;text-align:left}
+-.menurow:last-child{border-bottom:0}
+-.menurow small{color:var(--mute);font-size:10px;margin-left:6px}
+-.menurow.danger{color:var(--danger)}
++.batch .n{flex:1;min-width:0;color:var(--sub);font-size:13px;white-space:nowrap}
++.batch .n b{color:var(--text);font-weight:600;font-size:15px;margin-right:2px}
++.batch button{flex:none;height:40px;padding:0 9px;border-radius:10px;display:flex;align-items:center;gap:5px;font-size:14px;color:var(--text);white-space:nowrap}
++.batch button:active{background:var(--raise)}
++.batch svg{width:17px;height:17px}
++.batch .primary{color:var(--ac-t)}
++.batch .muted{color:var(--mute);padding:0 7px}
++.sheet{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:60;align-items:flex-end;justify-content:center}
++.box{background:var(--raise);border-radius:18px 18px 0 0;width:min(700px,100%);max-height:82vh;overflow:auto;
++  padding:18px 20px calc(24px + env(safe-area-inset-bottom))}
++.box h2{font-family:var(--serif);font-weight:400;font-size:19px;margin:0 0 4px;display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
++.box h2 small{font-family:-apple-system,"Microsoft YaHei",sans-serif;font-size:12.5px;color:var(--mute)}
++.box .sub{color:var(--mute);font-size:12px;margin-bottom:12px}
++.fsec{padding:12px 0 4px;border-top:1px solid var(--line)}
++.fsec.first{border-top:0}
++.box h3{color:var(--mute);font-size:12px;font-weight:400;margin:0 0 10px;display:flex;align-items:center;justify-content:space-between}
++.settings h3{margin:16px 0 6px}
++.frow{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
++.fopt{height:32px;padding:0 10px;background:var(--raise);box-shadow:inset 0 0 0 1px var(--line);color:var(--sub);border-radius:8px;font-size:13px;white-space:nowrap}
++.fopt.on{background:var(--ac-soft);box-shadow:none;color:var(--ac-t)}
++.fopt:disabled{opacity:.35;cursor:default}
++.fopt .c{color:var(--mute);font-size:11px;margin-left:3px}
++.fopt .dot{display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--ac);margin-right:5px;vertical-align:2px}
++.seg{display:flex;background:var(--bg);border-radius:7px;padding:2px}
++.seg button{font-size:11.5px;padding:3px 8px;border-radius:5px;color:var(--mute)}
++.seg button.on{background:var(--raise2);color:var(--text)}
++.sheet-actions{display:flex;gap:8px;margin-top:14px}
++.sheet-actions button{flex:none;height:46px;padding:0 18px;border-radius:12px;box-shadow:inset 0 0 0 1px var(--line);color:var(--sub)}
++.sheet-actions .primary{flex:1;background:var(--ac);box-shadow:none;color:#fff;font-weight:600;font-size:15px}
++.sheet-actions .primary:disabled{opacity:.4}
++.sticky{position:sticky;bottom:calc(-24px - env(safe-area-inset-bottom));background:var(--raise);padding:12px 0 0;margin-top:6px}
++.menurow{display:flex;align-items:center;gap:12px;justify-content:space-between;width:100%;padding:13px 2px;border-top:1px solid var(--line);
++  font-size:15px;text-align:left;color:inherit;text-decoration:none}
++.menurow span:last-child{color:var(--mute);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
++.menurow small{color:var(--mute);font-size:12px;margin-left:6px}
++.menurow.danger,.menurow.danger span:last-child{color:var(--danger)}
+ .menurow.off{opacity:.35;pointer-events:none}
+-.catrow2{display:flex;align-items:center;gap:8px;padding:8px 1px;border-bottom:1px solid var(--line)}
+-.catrow2 .cb{width:18px;height:18px;border-radius:4px;border:1.5px solid var(--mute);flex:none;
+-  display:flex;align-items:center;justify-content:center;font-size:12px}
+-.catrow2.on .cb{background:var(--ac);border-color:var(--ac);color:#fff}
+-.catrow2 span{font-size:12px;flex:1}
+-.newcat{display:flex;gap:6px;margin-top:9px}
+-.newcat input{flex:1;background:var(--raise);border:0;border-radius:7px;color:var(--text);padding:7px 9px;outline:none;font-size:11px}
+-.newcat button{background:var(--raise);border-radius:7px;padding:7px 9px;font-size:11px;color:var(--ac-t)}
+-.followrow{display:flex;align-items:center;gap:9px;padding:9px 0;border-bottom:1px solid var(--line)}
+-.followrow:last-child{border-bottom:0}
+-.fa{width:32px;height:32px;border-radius:50%;background:var(--raise);overflow:hidden;display:flex;
+-  align-items:center;justify-content:center;font-size:10px;flex:none}
+-.fa img{width:100%;height:100%;object-fit:cover}
+-.fn{flex:1;min-width:0;font-size:12px}
+-.fn small{display:block;color:var(--mute);font-size:10px;margin-top:2px}
+-.fb{display:flex;gap:4px}
+-.fb button{color:var(--sub);font-size:10px;padding:3px}
+-.fb .new{color:var(--ac-t)}
+-.switchrow{display:flex;align-items:center;justify-content:space-between;margin:8px 0;font-size:12px}
+-.switch{width:34px;height:19px;border-radius:10px;background:var(--raise);position:relative}
++.catrow2{display:flex;align-items:center;gap:12px;padding:13px 2px;border-top:1px solid var(--line);cursor:pointer;font-size:15px}
++.catrow2 span:first-child{flex:1}
++.catrow2.on{color:var(--ac-t)}
++.catrow2 .cb{width:18px;height:18px;border-radius:5px;box-shadow:inset 0 0 0 1.5px var(--line);flex:none;display:grid;place-items:center}
++.catrow2 .cb svg{width:12px;height:12px;stroke-width:3}
++.catrow2.on .cb{background:var(--ac);box-shadow:none;color:#fff}
++.newcat{display:flex;gap:8px;padding-top:12px;border-top:1px solid var(--line)}
++.newcat input{flex:1;min-width:0;background:var(--bg);border:0;border-radius:8px;color:var(--text);padding:0 10px;height:36px;outline:none}
++.newcat button{flex:none;color:var(--ac-t);padding:0 8px}
++.followrow{display:flex;align-items:center;gap:12px;padding:12px 0;border-top:1px solid var(--line)}
++.fa{position:relative;width:38px;height:38px;border-radius:50%;background:var(--raise2);overflow:hidden;display:grid;place-items:center;font-weight:600;flex:none}
++.fa img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
++.fn{flex:1;min-width:0;font-size:15px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
++.fn small{display:block;color:var(--mute);font-size:12px;font-weight:400;margin-top:2px;overflow:hidden;text-overflow:ellipsis}
++.fn small em{font-style:normal;color:var(--ac-t)}
++.fb{flex:none;display:flex;gap:6px}
++.fb button{height:30px;padding:0 9px;border-radius:8px;box-shadow:inset 0 0 0 1px var(--line);color:var(--sub);font-size:12.5px;white-space:nowrap}
++.fb .new{background:var(--ac-soft);box-shadow:none;color:var(--ac-t)}
++.switchrow{display:flex;align-items:center;justify-content:space-between;padding:4px 0 12px;color:var(--sub)}
++.switch{flex:none;width:40px;height:24px;border-radius:12px;background:var(--line);position:relative}
+ .switch.on{background:var(--ac)}
+-.switch::after{content:"";position:absolute;width:15px;height:15px;border-radius:50%;background:#fff;top:2px;left:2px;transition:.15s}
+-.switch.on::after{left:17px}
+-.viewer{position:fixed;inset:0;background:#090807;z-index:80;display:none;flex-direction:column}
+-.viewer.show{display:flex}
+-.vclose{position:absolute;right:14px;top:10px;color:#fff;font-size:27px;z-index:2}
+-.vstage{flex:1;display:flex;align-items:center;justify-content:center;min-height:0;padding:20px 12px 0}
+-.vstage img{max-width:96vw;max-height:72vh;object-fit:contain}
+-.vnav{position:absolute;top:44%;color:#d8d0c6;font-size:28px;padding:12px;z-index:2}
++.switch::after{content:"";position:absolute;width:18px;height:18px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s}
++.switch.on::after{transform:translateX(16px)}
++.viewer{position:fixed;inset:0;background:#0a0908;z-index:80;flex-direction:column}
++.vclose{position:absolute;right:10px;top:10px;width:36px;height:36px;display:grid;place-items:center;color:#fff;z-index:2}
++.vstage{flex:1;display:flex;align-items:center;justify-content:center;min-height:0;padding:50px 12px 0}
++.vstage img{max-width:100%;max-height:100%;object-fit:contain;border-radius:6px}
++.vnav{position:absolute;top:44%;width:40px;height:56px;display:grid;place-items:center;color:#d8d0c6;z-index:2}
+ .vnav.p{left:3px}.vnav.n{right:3px}
+-.vinfo{background:#141210;padding:12px 16px 18px;max-height:35vh;overflow:auto}
+-.vihead{display:flex;align-items:baseline;gap:8px}
+-.vihead b{font-family:var(--serif);font-size:18px;font-weight:400}
+-.vihead span{color:var(--sub);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+-.vmeta{color:var(--mute);font-size:10.5px;line-height:1.6;margin-top:6px}
++@media(hover:none){.vnav{display:none}}
++.vinfo{padding:14px 20px calc(16px + env(safe-area-inset-bottom));max-height:40vh;overflow:auto}
++.vihead{font-size:16px;font-weight:600}
++.vmeta{color:var(--mute);font-size:12px;margin-top:4px;font-variant-numeric:tabular-nums}
+ .vmeta a{color:var(--ac-t);text-decoration:none}
+-.vacts{display:flex;gap:6px;margin-top:10px}
+-.vacts button{background:var(--raise);border-radius:7px;padding:7px 11px;font-size:11px}
+-.vacts .primary{background:var(--ac);color:#fff}
+-.toast{position:fixed;left:50%;bottom:78px;transform:translateX(-50%);background:#e7e1d6;color:#1b1815;
+-  padding:8px 14px;border-radius:7px;font-size:11.5px;opacity:0;transition:.2s;pointer-events:none;z-index:90}
++.vacts{display:flex;gap:8px;margin-top:12px}
++.vacts button{flex:1;height:46px;background:var(--raise);border-radius:10px;display:flex;align-items:center;justify-content:center;gap:6px}
++.vacts button svg{width:17px;height:17px}
++.vacts .primary{color:var(--ac-t)}
++.vacts .primary.on svg{fill:var(--ac-t)}
++.vacts .square{flex:0 0 46px}
++.toast{position:fixed;left:50%;bottom:90px;transform:translateX(-50%);background:var(--text);color:#131210;
++  padding:8px 14px;border-radius:10px;font-size:13px;opacity:0;transition:.2s;pointer-events:none;z-index:90;white-space:nowrap}
+ .toast.show{opacity:1}
+ /* ---- motion ---- */
+ @keyframes cardIn{from{opacity:0;transform:translateY(14px) scale(.985)}to{opacity:1;transform:none}}
+-@keyframes imgIn{to{opacity:1}}
+ @keyframes slideL{from{opacity:.2;transform:translateX(28px)}to{opacity:1;transform:none}}
+ @keyframes slideR{from{opacity:.2;transform:translateX(-28px)}to{opacity:1;transform:none}}
+ @keyframes spin{to{transform:rotate(360deg)}}
+ @keyframes fadeIn{from{opacity:0}to{opacity:1}}
+ @keyframes toastIn{from{opacity:0;transform:translate(-50%,8px)}to{opacity:1;transform:translate(-50%,0)}}
+-@keyframes sheetUp{from{opacity:0;transform:translateY(26px) scale(.985)}to{opacity:1;transform:none}}
+-@keyframes viewerIn{from{opacity:0;transform:scale(.985)}to{opacity:1;transform:none}}
+ .card{animation:cardIn .38s cubic-bezier(.22,.8,.25,1) both;animation-delay:calc(var(--i,0)*24ms)}
+-.card{transition:transform .22s ease,opacity .2s}
+-.card:hover{transform:translateY(-2px)}
+ .photo img{opacity:0;transition:opacity .35s ease}
+ .photo img.loaded{opacity:1}
++/* 操作后的就地刷新：不重播入场动画，也不让图片闪一下 */
++.grid.still .card{animation:none}
++.grid.still .photo img{opacity:1;transition:none}
+ .grid.slide-l{animation:slideL .34s cubic-bezier(.22,.8,.25,1)}
+ .grid.slide-r{animation:slideR .34s cubic-bezier(.22,.8,.25,1)}
+-.icon,.filterbtn,.selectall,.tabs button,.catquick button,.searchicon{transition:color .18s,background .18s,transform .12s,opacity .18s}
+-.icon:active,.filterbtn:active,.selectall:active,.catquick button:active,.searchicon:active{transform:scale(.88)}
+-.tabs button::after{transition:transform .22s,opacity .22s}
+-.platforms button,.fopt,.chip,.ftag,.menurow,.catrow2,.followrow,.switch{transition:color .18s,background .18s,transform .15s,border-color .18s}
+-.fopt:active,.chip:active,.ftag:active,.menurow:active{transform:scale(.97)}
++.fopt:active,.ftag:active,.menurow:active{transform:scale(.97)}
+ .sheet{display:flex;opacity:0;visibility:hidden;pointer-events:none;transition:opacity .22s ease,visibility .22s}
+ .sheet.show{opacity:1;visibility:visible;pointer-events:auto}
+-.sheet .box{transform:translateY(28px) scale(.985);transition:transform .28s cubic-bezier(.22,.9,.28,1);}
+-.sheet.show .box{transform:none;animation:sheetUp .28s cubic-bezier(.22,.9,.28,1)}
++.sheet .box{transform:translateY(100%);transition:transform .28s cubic-bezier(.2,.8,.2,1)}
++.sheet.show .box{transform:none}
+ .viewer{display:flex;opacity:0;visibility:hidden;pointer-events:none;transition:opacity .22s,visibility .22s}
+ .viewer.show{opacity:1;visibility:visible;pointer-events:auto}
+-.viewer.show .vstage{animation:viewerIn .3s ease}
+-.batch{transition:transform .3s cubic-bezier(.2,1.2,.3,1),opacity .2s;opacity:0}
++.batch{transition:transform .28s cubic-bezier(.2,.8,.2,1),opacity .2s;opacity:0}
+ .batch.show{opacity:1}
+-.toast{animation:none}
+ .toast.show{animation:toastIn .22s ease}
+-.loading{position:fixed;inset:0;z-index:70;display:none;flex-direction:column;align-items:center;
+-  justify-content:center;gap:12px;background:rgba(19,18,16,.9);backdrop-filter:blur(5px);color:var(--sub)}
++/* 只占列表区，顶栏和 tab 还能点 */
++.loading{position:fixed;inset:0;z-index:20;display:none;flex-direction:column;align-items:center;
++  justify-content:center;gap:12px;color:var(--sub);pointer-events:none}
+ .loading.show{display:flex;animation:fadeIn .18s ease}
+ .spinner{width:30px;height:30px;border:2px solid var(--line);border-top-color:var(--ac-t);
+   border-radius:50%;animation:spin .8s linear infinite}
+-.loading .msg{font-size:12px;letter-spacing:.03em}
+-.loading .submsg{font-size:10px;color:var(--mute)}
++.loading .msg{font-size:12px}
++@media(hover:hover){.card:not(.gone):hover .photo img{filter:brightness(1.05)}}
+ @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;
+   animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
+ @media(max-width:700px){
+-  header{padding:12px 14px 0}
+-  h1{font-size:28px}
+-  .icon{width:35px;height:35px;font-size:18px}
+-  main{padding:3px 12px 20px}
+-  .grid{column-count:2;column-width:auto;column-gap:9px}
+-  .card{margin-bottom:11px}
+-  .photo{border-radius:9px}
+-  .artist{font-size:11.5px}
+-  .title{font-size:10.5px}
+-  .catline{font-size:9.5px}
+-  .cardbar button{font-size:16px;padding:2px 6px}
+-  .batch{bottom:9px}
+-}
+-@media(min-width:701px){
+-  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(218px,1fr));gap:18px;column-width:auto}
+-  .card{break-inside:auto;margin:0}
+-  .photo img{aspect-ratio:4/5;object-fit:cover}
+-}
+-body.android .grid{display:block;column-count:2;column-width:auto;column-gap:9px}
+-body.android .card{break-inside:avoid;margin:0 0 11px}
+-body.android .photo img{aspect-ratio:auto;object-fit:initial}
++  header{padding:14px 14px 0}
++  main{padding:4px 14px 20px}
++  .catquick{margin:0 -14px;padding:12px 14px 10px}
++  .grid{column-count:2;column-width:auto;column-gap:14px}
++}
++body.android .grid{column-count:2;column-width:auto;column-gap:14px}
+ </style>
+ </head>
+ <body>
+@@ -287,10 +280,10 @@
+   <div class="topbar">
+     <h1>Art<span>Radar</span></h1>
+     <div class="icons">
+-      <button class="icon" id="aiToggleBtn" title="找新图" aria-label="找新图">⊕</button>
+-      <button class="icon" id="uploadBtn" title="上传" aria-label="上传">↑</button>
+-      <button class="icon" id="refreshBtn" title="刷新" aria-label="刷新">↻</button>
+-      <button class="icon" id="settingsBtn" title="设置" aria-label="设置">⚙</button>
++      <button class="icon" id="aiToggleBtn" title="找新图" aria-label="找新图"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/><path d="M11 8v6M8 11h6"/></svg></button>
++      <button class="icon" id="uploadBtn" title="上传" aria-label="上传"><svg viewBox="0 0 24 24"><path d="M12 15V4M7.5 8.5 12 4l4.5 4.5M5 15v4a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-4"/></svg></button>
++      <button class="icon" id="refreshBtn" title="刷新" aria-label="刷新"><svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.4-5.7L20 8.5"/><path d="M20 4v4.5h-4.5"/></svg></button>
++      <button class="icon" id="settingsBtn" title="设置" aria-label="设置"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg></button>
+     </div>
+   </div>
+   <div class="statline">
+@@ -302,11 +295,10 @@
+   </div>
+   <section class="ai open" id="aiBox">
+     <div class="aiinput">
+-      <input id="kw" placeholder="关键词…" autocomplete="off">
++      <input id="kw" placeholder="关键词，或：在微博帮我找一组画师稿" autocomplete="off">
+       <span class="div"></span>
+       <input class="num" id="limit" type="number" min="1" max="50" value="10">
+-      <span class="unit">张</span>
+-      <button class="enter" id="more" title="再来一组">⏎</button>
++      <button class="enter" id="more" title="再来一组"></button>
+     </div>
+     <div class="aiQuick" id="aiQuick"></div>
+     <div class="platforms" id="platformPills">
+@@ -319,16 +311,15 @@
+     <button class="aicancel" id="moreCancel">取消当前抓取</button>
+   </section>
+   <div class="tabrow" id="tabRow">
+-    <button class="filterbtn" id="filterBtn">筛选 <b id="filterBadge" hidden>0</b></button>
++    <button class="filterbtn" id="filterBtn" title="筛选" aria-label="筛选"><svg viewBox="0 0 24 24"><path d="M4 6h16M7 12h10M10 18h4"/></svg><b id="filterBadge" hidden>0</b></button>
+     <div class="tabs" id="tabs">
+       <button data-tab="pending" class="on">待确认<span class="n" data-count="pending"></span></button>
+       <button data-tab="kept">已收藏<span class="n" data-count="kept"></span></button>
+       <button data-tab="rejected">已拒绝<span class="n" data-count="rejected"></span></button>
+     </div>
+-    <button class="selectall" id="selectAll">全选</button>
+-    <button class="searchicon" id="searchOpen" title="本地搜索">⌕</button>
++    <button class="searchicon" id="searchOpen" title="在库里搜" aria-label="在库里搜"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></button>
+     <div class="localsearch" id="localSearch">
+-      <input id="localInput" placeholder="搜索画师 / 标题 / 分类" autocomplete="off">
++      <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg><input id="localInput" type="search" enterkeyhint="search" placeholder="在库里搜 画师 / 标题 / 分类" autocomplete="off">
+       <button id="localCancel" onmousedown="event.preventDefault()">取消</button>
+     </div>
+   </div>
+@@ -338,11 +329,13 @@
+ <main><div class="grid" id="grid"></div></main>
+ 
+ <div class="batch" id="batchbar">
+-  <span class="n" id="batchCount">0 张已选</span>
+-  <button class="primary" data-batch="fav">☆ 存分类</button>
++  <span class="n" id="batchCount"></span>
++  <button class="primary" data-batch="fav"><svg viewBox="0 0 24 24"><path d="M12 3.5l2.6 5.3 5.9.9-4.3 4.1 1 5.8L12 16.9l-5.2 2.7 1-5.8-4.3-4.1 5.9-.9z"/></svg>收藏</button>
++  <button class="primary" data-batch="restore">放回</button>
+   <button data-batch="cat">分类</button>
+-  <button class="danger" data-batch="reject">× 不要</button>
+-  <button data-batch="clear">取消</button>
++  <button data-batch="reject">不要</button>
++  <button class="muted" id="selectAll">全选</button>
++  <button class="muted" data-batch="clear">取消</button>
+ </div>
+ 
+ <div class="sheet" id="filterSheet"><div class="box" id="filterBox"></div></div>
+@@ -352,21 +345,21 @@
+ <div class="sheet" id="settingsSheet"><div class="box" id="settingsBox"></div></div>
+ 
+ <div class="viewer" id="viewer">
+-  <button class="vclose" id="viewerClose">×</button>
++  <button class="vclose" id="viewerClose" aria-label="关闭"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+   <button class="vnav p" id="viewerPrev">‹</button>
+   <button class="vnav n" id="viewerNext">›</button>
+   <div class="vstage"><img id="big" alt=""></div>
+   <div class="vinfo" id="viewerInfo"></div>
+ </div>
+ <input id="fileInput" type="file" accept="image/*" multiple hidden>
+-<div class="loading" id="loading"><div class="spinner"></div><div class="msg" id="loadingText">加载中…</div><div class="submsg">请稍候</div></div>
++<div class="loading" id="loading"><div class="spinner"></div><div class="msg" id="loadingText">加载中…</div></div>
+ <div class="toast" id="toast"></div>
+ 
+ <script>
+ const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
+ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+ const TOKEN=new URLSearchParams(location.search).get('token')||'';
+-const state={tab:'pending',cats:[],all:[],items:[],following:[],counts:{},root:'',artistsDir:'',
++const state={tab:'pending',cats:[],all:[],items:[],following:[],counts:{},root:'',artistsDir:'',artistsDirName:'',
+   filters:{cats:new Set(),catMode:'any',artists:new Set(),onlyFollowed:false,platforms:new Set(),multi:false,sort:'newest'},
+   draft:null,localQ:'',platform:'all'};
+ const sel=new Set();
+@@ -383,8 +376,13 @@
+ const platformOf=it=>{const s=it.source||'';if(s.startsWith('pixiv'))return 'pixiv';if(s==='weibo')return 'weibo';
+   if(s==='pinterest')return 'pinterest';if(s==='upload')return 'upload';return s};
+ const manualCats=it=>(it.manual_tags||[]).filter(Boolean);
+-const allCats=it=>[...new Set([...manualCats(it),it.suggested].filter(Boolean))];
++// 显示和筛选用同一个口径：有人工分类就只算人工的，否则才算 AI 建议
++const allCats=it=>{const m=manualCats(it);return m.length?m:(it.suggested?[it.suggested]:[])};
+ const followedNames=()=>new Set(state.following.map(x=>x.artist));
++const imgUrl=u=>u&&TOKEN?u+'?token='+encodeURIComponent(TOKEN):u;
++const safeUrl=u=>/^https?:\/\//i.test(u||'')?u:'';
++const PLATFORM_NAME={weibo:'微博',pixiv:'Pixiv',pinterest:'Pinterest',upload:'上传'};
++const FOLDER_ICON='<svg viewBox="0 0 24 24"><path d="M3.5 7.5a2 2 0 0 1 2-2h4l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/></svg>';
+ const TABS=['pending','kept','rejected'];
+ const tabName=t=>t==='pending'?'待确认':t==='kept'?'已收藏':'已拒绝';
+ const ICON={
+@@ -393,26 +391,51 @@
+   no:'<svg viewBox="0 0 24 24"><path d="M6.2 6.2l11.6 11.6M17.8 6.2L6.2 17.8"/></svg>',
+   trash:'<svg viewBox="0 0 24 24"><path d="M5 7h14M9.3 7V4.2h5.4V7M8.2 7l.9 12.5h5.8L15.8 7M10.3 10.5v5.8M13.7 10.5v5.8"/></svg>',
+   more:'<svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.2" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.2" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1.2" fill="currentColor" stroke="none"/></svg>',
++  check:'<svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>',
++  caret:'<svg viewBox="0 0 24 24"><path d="M7 10l5 5 5-5"/></svg>',
++  enter:'<svg viewBox="0 0 24 24"><path d="M9 10l-5 5 5 5"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/></svg>',
+   restore:'<svg viewBox="0 0 24 24"><path d="M9 7H4.8v4.2M4.8 11a8 8 0 1 0 2.2-5.6"/></svg>'
+ };
+ let loadSeq=0;
+ function clearGrid(){const g=$('#grid');g.innerHTML='';g.classList.remove('slide-l','slide-r')}
+ function showLoading(msg){$('#loadingText').textContent=msg;$('#loading').classList.add('show')}
+ function hideLoading(){$('#loading').classList.remove('show')}
+-async function finishLoading(t0){const wait=Math.max(0,320-(Date.now()-t0));if(wait)await new Promise(r=>setTimeout(r,wait));hideLoading()}
++async function finishLoading(t0){const wait=Math.max(0,150-(Date.now()-t0));if(wait)await new Promise(r=>setTimeout(r,wait));hideLoading()}
+ function showLoadError(e){
+   clearGrid();
+   $('#grid').innerHTML=`<div class="empty">加载失败：${esc(e.message||e)}<br><button id="retryLoad">重试</button></div>`;
+   const b=$('#retryLoad');if(b)b.onclick=()=>refresh();
+ }
++function applyState(s){
++  state.cats=s.categories||[];state.following=s.following||[];state.counts=s.counts||{};
++  state.root=s.root||'';state.artistsDir=s.artists_dir||'';state.artistsDirName=s.artists_dir_name||'';state.local=!!s.local;
++  $('#libCount').innerHTML='<b>'+(state.counts.kept||0)+'</b> 张入库';
++  renderTabs();renderAvatars();
++}
++async function syncState(){try{applyState(await api('/api/state'))}catch(e){}}
++// 操作后的就地刷新：不清空列表、不弹 loading、不丢滚动位置
++async function softReload(){
++  const j=await api('/api/items?status='+state.tab);
++  state.all=j.items||[];sel.clear();selAnchor=null;apply(true);syncState();
++}
++// 卡片淡出后从列表拿掉，其余卡片不动
++function removeCards(ids){
++  const gone=new Set(ids);
++  $$('.card').forEach(c=>{if(gone.has(c.dataset.id))c.classList.add('gone')});
++  ids.forEach(id=>sel.delete(id));syncSel();
++  setTimeout(()=>{
++    state.all=state.all.filter(x=>!gone.has(x.id));state.items=state.items.filter(x=>!gone.has(x.id));
++    $$('.card.gone').forEach(c=>c.remove());
++    if(!state.items.length)render(true);
++    renderCatQuick();syncSel();
++  },180);
++  syncState();
++}
+ async function refresh(){
+   const seq=++loadSeq;clearGrid();showLoading('正在连接 ArtRadar…');const t0=Date.now();
+   try{
+     const s=await api('/api/state');if(seq!==loadSeq)return;
+-    state.cats=s.categories||[];state.following=s.following||[];state.counts=s.counts||{};
+-    state.root=s.root||'';state.artistsDir=s.artists_dir||'';
+-    $('#libCount').innerHTML='<b>'+(state.counts.kept||0)+'</b> 张入库';
+-    renderTabs();renderAvatars();
++    applyState(s);
+     const j=await api('/api/items?status='+state.tab);if(seq!==loadSeq)return;
+     state.all=j.items||[];sel.clear();selAnchor=null;syncSel();apply();
+   }catch(e){if(seq===loadSeq)showLoadError(e)}
+@@ -448,78 +471,72 @@
+   $('#newText').textContent=list.length?(hot?hot+' 位有新作':'关注 '+list.length+' 位'):'长按画师名关注';
+   $('#newText').classList.toggle('hot',hot>0);
+   const show=list.slice(0,4);let html=show.map(a=>`<span class="avatar" data-favartist="${esc(a.artist)}" title="${esc(a.artist)}">`+
+-    (a.avatar?`<img src="${a.avatar}" alt="">`:esc((a.artist||'?').slice(0,1)))+(a.has_new?'<span class="nd"></span>':'')+`</span>`).join('');
++    (a.avatar?`<img src="${esc(imgUrl(a.avatar))}" alt="">`:esc((a.artist||'?').slice(0,1)))+(a.has_new?'<span class="nd"></span>':'')+`</span>`).join('');
+   if(list.length>4)html+=`<span class="avatar more">+${list.length-4}</span>`;
+   $('#avatars').innerHTML=html;
+ }
+-function baseFiltered(f,skipCats=false){
+-  let arr=state.all.slice();
++const postKey=it=>it.page_url&&platformOf(it)!=='pinterest'?it.page_url:'';
++function postGroups(){const g={};state.all.forEach(it=>{const k=postKey(it);if(k)g[k]=(g[k]||0)+1});return g}
++function filterItems(f,skipCats=false){
++  let arr=state.all;
+   const q=state.localQ.trim().toLowerCase();
+-  if(q)arr=arr.filter(it=>[it.artist,it.title,it.source,it.suggested,...(it.manual_tags||[])].join(' ').toLowerCase().includes(q));
++  if(q)arr=arr.filter(it=>[it.artist,it.title,it.source,...allCats(it)].join(' ').toLowerCase().includes(q));
+   if(!skipCats&&f.cats.size)arr=arr.filter(it=>{const c=allCats(it);
+     return f.catMode==='all'?[...f.cats].every(x=>c.includes(x)):[...f.cats].some(x=>c.includes(x))});
+   if(f.artists.size)arr=arr.filter(it=>f.artists.has(it.artist||''));
+-  if(f.onlyFollowed)arr=arr.filter(it=>followedNames().has(it.artist||''));
++  if(f.onlyFollowed){const names=followedNames();arr=arr.filter(it=>names.has(it.artist||''))}
+   if(f.platforms.size)arr=arr.filter(it=>f.platforms.has(platformOf(it)));
+-  if(f.multi){const g={};state.all.forEach(it=>{if(it.page_url&&platformOf(it)!=='pinterest')g[it.page_url]=(g[it.page_url]||0)+1});
+-    arr=arr.filter(it=>it.page_url&&platformOf(it)!=='pinterest'&&g[it.page_url]>1)}
+-  const s=f.sort;
++  if(f.multi){const g=postGroups();arr=arr.filter(it=>g[postKey(it)]>1)}
++  return arr;
++}
++function baseFiltered(f,skipCats=false){
++  const arr=filterItems(f,skipCats).slice(),s=f.sort;
+   arr.sort((a,b)=>s==='oldest'?String(a.created_at).localeCompare(String(b.created_at)):
+     s==='artist'?String(a.artist||'').localeCompare(String(b.artist||''),'zh'):
+     s==='size'?(Number(b.width)*Number(b.height))-(Number(a.width)*Number(a.height)):
+     String(b.created_at||'').localeCompare(String(a.created_at||'')));
+   return arr;
+ }
+-function apply(){state.items=baseFiltered(state.filters);render();renderCatQuick();renderActiveFilters();
++function apply(still=false){state.items=baseFiltered(state.filters);render(still);renderCatQuick();renderActiveFilters();
+   if(sel.size){sel.clear();selAnchor=null;syncSel()}
+   const n=state.filters.cats.size+state.filters.artists.size+state.filters.platforms.size+
+     (state.filters.onlyFollowed?1:0)+(state.filters.multi?1:0)+(state.localQ?1:0)+
+     (state.filters.sort!=='newest'?1:0);
+   const b=$('#filterBadge');b.hidden=!n;b.textContent=n;$('#filterBtn').classList.toggle('hot',n>0);
+ }
+-function render(){
+-  const g=$('#grid');
++function hasFilters(){const f=state.filters;
++  return !!(state.localQ||f.cats.size||f.artists.size||f.platforms.size||f.onlyFollowed||f.multi)}
++function render(still=false){
++  const g=$('#grid');g.classList.toggle('still',!!still);
+   if(!state.items.length){
+-    g.innerHTML=`<div class="empty">库里没有匹配的图。`+
+-      (state.localQ?`<br><button id="onlineFind">去网上找「${esc(state.localQ)}」</button>`:'')+`</div>`;
++    g.innerHTML=`<div class="empty">`+(state.localQ?`库里没有「${esc(state.localQ)}」<button id="onlineFind">去网上找「${esc(state.localQ)}」</button>`:
++      hasFilters()?'没有符合筛选的图':'这里还空着')+`</div>`;
+     const of=$('#onlineFind');
+-    if(of){of.onmousedown=e=>e.preventDefault();of.onclick=()=>{const q=state.localQ;closeLocal(true);$('#aiBox').classList.add('open');
+-      $('#aiToggleBtn').classList.add('on');$('#kw').value=q;$('#kw').focus()}}
+-    return;
++    if(of){of.onmousedown=e=>e.preventDefault();of.onclick=()=>{const q=state.localQ;closeLocal(true);openAi();
++      $('#kw').value=q;scrollTo({top:0,behavior:'smooth'});$('#kw').focus()}}
++    syncSel();return;
+   }
+-  const followed=followedNames(),groups={};
+-  state.all.forEach(it=>{if(it.page_url&&platformOf(it)!=='pinterest')groups[it.page_url]=(groups[it.page_url]||0)+1});
++  const followed=followedNames(),groups=postGroups();
+   g.innerHTML=state.items.map((it,idx)=>{
+-    const manual=manualCats(it),cats=manual.length?manual.join(' · '):(it.suggested||'未分类');
+-    const aiClass=state.tab==='pending'&&!manual.length&&it.suggested?' ai':'';
+-    const mc=it.page_url&&platformOf(it)!=='pinterest'?groups[it.page_url]||1:1;
+-    let bar='';
+-    if(state.tab==='pending'){
+-      bar=`<button class="star" data-act="savcat" data-id="${it.id}" title="存分类" aria-label="存分类">${ICON.star}</button>
+-        <button class="person${it.artist?'':' off'}" data-act="saveartist" data-id="${it.id}" title="存画师" aria-label="存画师">${ICON.person}</button>
+-        <button class="no" data-act="reject" data-id="${it.id}" title="拒绝" aria-label="拒绝">${ICON.no}</button>
+-        <button class="del" data-act="delete" data-id="${it.id}" title="删除" aria-label="删除">${ICON.trash}</button>
+-        <button class="more" data-act="more" data-id="${it.id}" title="更多" aria-label="更多">${ICON.more}</button>`;
+-    }else if(state.tab==='kept'){
+-      bar=`<button class="star off" title="已存分类" aria-label="已存分类">${ICON.star}</button>
+-        <button class="person${it.artist?'':' off'}" data-act="saveartist" data-id="${it.id}" title="存画师" aria-label="存画师">${ICON.person}</button>
+-        <button class="no" data-act="reject" data-id="${it.id}" title="拒绝" aria-label="拒绝">${ICON.no}</button>
+-        <button class="del" data-act="delete" data-id="${it.id}" title="删除" aria-label="删除">${ICON.trash}</button>
+-        <button class="more" data-act="more" data-id="${it.id}" title="更多" aria-label="更多">${ICON.more}</button>`;
+-    }else{
+-      bar=`<button class="star" data-act="restore" data-id="${it.id}" title="放回待确认" aria-label="放回待确认">${ICON.restore}</button>
+-        <button class="del" data-act="delete" data-id="${it.id}" title="删除" aria-label="删除">${ICON.trash}</button>
+-        <button class="more" data-act="more" data-id="${it.id}" title="更多" aria-label="更多">${ICON.more}</button>`;
+-    }
++    const cats=allCats(it).join(' · ')||'未分类';
++    const aiClass=state.tab==='pending'&&!manualCats(it).length&&it.suggested?' ai':'';
++    const mc=groups[postKey(it)]||1;
++    const first=state.tab==='rejected'
++      ?`<button class="restore" data-act="restore" data-id="${it.id}" title="放回待确认" aria-label="放回待确认">${ICON.restore}</button>`
++      :state.tab==='kept'
++      ?`<button class="star on" data-act="unkeep" data-id="${it.id}" title="取消收藏" aria-label="取消收藏">${ICON.star}</button>`
++      :`<button class="star" data-act="savcat" data-id="${it.id}" title="收藏" aria-label="收藏">${ICON.star}</button>`;
++    const ratio=it.width&&it.height?`aspect-ratio:${it.width}/${it.height}`:'';
+     return `<article class="card${sel.has(it.id)?' selected':''}" data-id="${it.id}" style="--i:${Math.min(idx,14)}">
+-      <div class="photo" data-view="${it.id}"><img loading="lazy" draggable="false" src="${it.thumb_url}" alt="" onload="this.classList.add('loaded')" onerror="this.classList.add('loaded')"></div>
++      <div class="photo" data-view="${it.id}" style="${ratio}"><img loading="lazy" draggable="false" src="${esc(imgUrl(it.thumb_url))}" alt="" onload="this.classList.add('loaded')" onerror="this.classList.add('loaded')"></div>
+       <div class="body">
+-        <span class="selcircle"></span>
+-        <div class="artistline"><button class="artist${followed.has(it.artist||'')?' followed':''}" data-artist="${esc(it.artist||'')}">${esc(it.artist||'未知名')}</button>
+-          ${mc>1?`<span class="multicount">${mc} 图</span>`:''}</div>
+-        <div class="title">${esc(it.title||'')}</div>
+-        <button class="catline${aiClass}" data-catpanel="${it.id}">${esc(cats)}<span class="caret">▾</span></button>
+-        <div class="cardbar">${bar}</div>
++        <div class="head">
++          ${it.artist?`<button class="artist${followed.has(it.artist)?' followed':''}" data-artist="${esc(it.artist)}">${esc(it.artist)}</button>`:`<span class="artist none">未知名</span>`}
++          <span class="selcircle">${ICON.check}</span>
++          <div class="cardbar">${first}<button class="more" data-act="more" data-id="${it.id}" title="调整" aria-label="调整">${ICON.more}</button></div>
++        </div>
++        ${it.title?`<div class="title">${esc(it.title)}</div>`:''}
++        <div class="foot"><button class="catline${aiClass}" data-catpanel="${it.id}"><span>${esc(cats)}</span>${ICON.caret}</button>${mc>1?`<span class="multicount">${mc} 图</span>`:''}</div>
+       </div>
+     </article>`;
+   }).join('');
+@@ -527,7 +544,7 @@
+ }
+ function renderCatQuick(){
+   const base=baseFiltered(state.filters,true);
+-  const counts={};const g={};state.all.forEach(it=>{if(it.page_url&&platformOf(it)!=='pinterest')g[it.page_url]=(g[it.page_url]||0)+1});
++  const counts={};
+   base.forEach(it=>allCats(it).forEach(c=>counts[c]=(counts[c]||0)+1));
+   const entries=Object.entries(counts).sort((a,b)=>b[1]-a[1]);
+   let html=`<button data-quickcat="" class="${state.filters.cats.size?'':'on'}">全部 <span class="n">${base.length}</span></button>`;
+@@ -537,22 +554,22 @@
+ }
+ function renderActiveFilters(){
+   const tags=[];
+-  if(state.localQ)tags.push(['q',state.localQ,'「'+state.localQ+'」']);
+-  state.filters.artists.forEach(a=>tags.push(['artist',a,a]));
++  if(state.localQ&&!$('#tabRow').classList.contains('searching'))tags.push(['q',state.localQ,'“'+state.localQ+'”']);
++  state.filters.artists.forEach(a=>tags.push(['artist',a,a||'未知名']));
+   if(state.filters.onlyFollowed)tags.push(['followed','1','只看关注']);
+-  state.filters.platforms.forEach(p=>tags.push(['platform',p,({weibo:'微博',pixiv:'Pixiv',pinterest:'Pinterest',upload:'上传'}[p]||p)]));
++  state.filters.platforms.forEach(p=>tags.push(['platform',p,PLATFORM_NAME[p]||p]));
+   if(state.filters.multi)tags.push(['multi','1','一帖多图']);
+-  if(state.filters.sort!=='newest')tags.push(['sort',state.filters.sort,({oldest:'最早',artist:'画师',size:'尺寸'}[state.filters.sort]||state.filters.sort)]);
++  if(state.filters.sort!=='newest')tags.push(['sort',state.filters.sort,({oldest:'最早在前',artist:'按画师',size:'大图在前'}[state.filters.sort]||state.filters.sort)]);
+   $('#activeFilters').innerHTML=tags.map(([k,v,l])=>`<span class="ftag">${esc(l)}<button data-rm="${k}" data-v="${esc(v)}">×</button></span>`).join('')+
+-    (tags.length>1?`<span class="ftag"><button data-rm="all">清除</button></span>`:'');
++    (tags.length+state.filters.cats.size>1?`<span class="ftag plain"><button data-rm="all">清除</button></span>`:'');
+ }
+ function syncSel(){
+   $$('.card').forEach(c=>c.classList.toggle('selected',sel.has(c.dataset.id)));
+   document.body.classList.toggle('selecting',sel.size>0);
+   $('#batchbar').classList.toggle('show',sel.size>0);
+-  $('#batchCount').textContent=sel.size+' 张已选';
+-  const canBatch=state.tab==='pending';
+-  $$('#batchbar [data-batch="fav"],#batchbar [data-batch="reject"]').forEach(b=>b.style.display=canBatch?'':'none');
++  $('#batchCount').innerHTML='<b>'+sel.size+'</b> 张';
++  const show=(a,on)=>{$('#batchbar [data-batch="'+a+'"]').style.display=on?'':'none'};
++  show('fav',state.tab==='pending');show('reject',state.tab!=='rejected');show('restore',state.tab==='rejected');
+   $('#selectAll').textContent=state.items.length&&sel.size===state.items.length?'取消全选':'全选';
+   if(selAnchor&&!state.items.some(x=>x.id===selAnchor))selAnchor=null;
+ }
+@@ -565,29 +582,38 @@
+ 
+ async function saveCategory(id){
+   const it=state.all.find(x=>x.id===id);if(!it)return;
+-  const cat=manualCats(it)[0]||it.suggested;
+-  if(!cat){openCatPanel([id]);return}
+-  try{await api('/api/accept',{ids:[id],category:cat});toast('已存到「'+cat+'」');await refresh()}
++  try{const j=await api('/api/accept',{ids:[id],by_follow:true});
++    const r=(j.results||[])[0]||{};if(!r.ok)throw new Error(r.error||'收藏失败');
++    removeCards([id]);
++    if(r.low_res){toast('已收藏，但原图下载失败，存的是预览图');return}
++    toast(followedNames().has(it.artist||'')?'已收藏到画师：'+it.artist:'已收藏到「'+(allCats(it)[0]||'未分类')+'」')}
+   catch(e){toast(e.message)}
+ }
+ async function saveArtist(id){
+   const it=state.all.find(x=>x.id===id);if(!it)return;
+   if(!it.artist){toast('没有画师信息');return}
+-  try{await api('/api/accept',{ids:[id],artist:true});toast('已存画师：'+it.artist);await refresh()}
++  try{const j=await api('/api/accept',{ids:[id],artist:true});
++    const r=(j.results||[])[0]||{};if(!r.ok)throw new Error(r.error||'存画师失败');
++    if(state.tab==='pending')removeCards([id]);else await softReload();
++    toast('已存到画师：'+it.artist)}
+   catch(e){toast(e.message)}
+ }
+ async function rejectItem(id){
+-  try{await api('/api/reject',{ids:[id],reason:'网页上快速拒绝'});toast('已拒绝');await refresh()}
++  try{await api('/api/reject',{ids:[id],reason:'网页上快速拒绝'});removeCards([id]);toast('已移到「已拒绝」')}
+   catch(e){toast(e.message)}
+ }
+ async function restoreItem(id){
+-  try{await api('/api/restore',{ids:[id]});toast('已放回待确认');await refresh()}
++  try{await api('/api/restore',{ids:[id]});removeCards([id]);toast('已放回待确认')}
++  catch(e){toast(e.message)}
++}
++async function unkeepItem(id){
++  if(!confirm('取消收藏这张？\n文件会移出分类文件夹，回到待确认；再次收藏会放回原处。'))return;
++  try{await api('/api/restore',{ids:[id]});removeCards([id]);toast('已取消收藏')}
+   catch(e){toast(e.message)}
+ }
+ async function deleteItem(id){
+-  const it=state.all.find(x=>x.id===id);
+   if(!confirm('直接删除这张图？\n磁盘文件和边车 JSON 会一起删除，不能撤销。'))return;
+-  try{await api('/api/delete',{ids:[id]});toast('已删除');await refresh()}
++  try{await api('/api/delete',{ids:[id]});removeCards([id]);toast('已删除')}
+   catch(e){toast(e.message)}
+ }
+ 
+@@ -604,9 +630,11 @@
+   $('#catSheet').classList.add('show');
+ }
+ function renderCatPanel(){
+-  const all=[...new Set([...state.cats,...catSelected])];
+-  $('#catBox').innerHTML=`<h2>分类 · 可多选</h2><div class="sub">${catIds.length>1?catIds.length+' 张 · 只追加不删除':''}</div>`+
+-    all.map(c=>`<div class="catrow2${catSelected.has(c)?' on':''}" data-cat="${esc(c)}"><span class="cb">${catSelected.has(c)?'✓':''}</span><span>${esc(c)}</span></div>`).join('')+
++  // 画师文件夹不是分类，几百个画师不该混进这个列表
++  const prefix=state.artistsDirName?state.artistsDirName+'/':'';
++  const all=[...new Set([...state.cats.filter(c=>!prefix||!c.startsWith(prefix)),...catSelected])];
++  $('#catBox').innerHTML=`<h2>分类<small>可多选${catIds.length>1?' · '+catIds.length+' 张，只追加不删除':''}</small></h2>`+
++    all.map(c=>`<div class="catrow2${catSelected.has(c)?' on':''}" data-cat="${esc(c)}"><span>${esc(c)}</span><span class="cb">${catSelected.has(c)?ICON.check:''}</span></div>`).join('')+
+     `<div class="newcat"><input id="newCat" placeholder="新建分类"><button id="newCatAdd">＋ 新建</button></div>
+      <div class="sheet-actions"><button id="catCancel">取消</button><button class="primary" id="catSave">${catIds.length>1?'追加':'完成'}</button></div>`;
+ }
+@@ -615,8 +643,8 @@
+   try{
+     if(catIds.length===1)await api('/api/tag',{ids:catIds,tags,mode:'replace'});
+     else if(tags.length)await api('/api/tag',{ids:catIds,tags,mode:'add'});
+-    toast(tags.length?'存到「'+tags.join('、')+'」':'已清空分类');
+-    closeSheet('catSheet');sel.clear();await refresh();
++    toast(tags.length?'存到「'+tags.join('、')+'」':catIds.length>1?'没有选分类':'已清空分类');
++    closeSheet('catSheet');await softReload();
+   }catch(e){toast(e.message)}
+ }
+ 
+@@ -625,64 +653,68 @@
+   onlyFollowed:f.onlyFollowed,platforms:new Set(f.platforms),multi:f.multi,sort:f.sort}}
+ function openFilter(){state.draft=cloneFilters(state.filters);renderFilterBox();$('#filterSheet').classList.add('show')}
+ function renderFilterBox(){
+-  const f=state.draft;const countsCat={},countsArtist={},countsPlat={};let multi=0;
+-  const g={};state.all.forEach(it=>{if(it.page_url&&platformOf(it)!=='pinterest')g[it.page_url]=(g[it.page_url]||0)+1});
+-  state.all.forEach(it=>{allCats(it).forEach(c=>countsCat[c]=(countsCat[c]||0)+1);
+-    const a=it.artist||'未知名';countsArtist[a]=(countsArtist[a]||0)+1;
+-    const p=platformOf(it);countsPlat[p]=(countsPlat[p]||0)+1;});
+-  multi=state.all.filter(it=>it.page_url&&platformOf(it)!=='pinterest'&&g[it.page_url]>1).length;
+-  const cc=Object.entries(countsCat).sort((a,b)=>b[1]-a[1]);
+-  const ac=Object.entries(countsArtist).sort((a,b)=>b[1]-a[1]).slice(0,60);
+-  const pc=Object.entries(countsPlat);
+-  const preview=baseFiltered({...f,cats:f.cats}).length;
+-  $('#filterBox').innerHTML=`<h2>筛选 · ${state.tab==='pending'?'待确认':state.tab==='kept'?'已收藏':'已拒绝'}</h2>
+-    <h3>分类</h3><div class="seg"><button data-catmode="any" class="${f.catMode==='any'?'on':''}">任一</button>
+-      <button data-catmode="all" class="${f.catMode==='all'?'on':''}">同时</button></div>
+-    <div class="frow">${cc.map(([c,n])=>`<button class="fopt${f.cats.has(c)?' on':''}" data-fcat="${esc(c)}" ${n===0?'disabled':''}>${esc(c)}<span class="c">${n}</span></button>`).join('')}</div>
+-    <h3>画师</h3><div class="switchrow"><span>只看关注的画师</span><button class="switch${f.onlyFollowed?' on':''}" data-fonly="1"></button></div>
+-    <div class="frow">${ac.map(([a,n])=>`<button class="fopt${f.artists.has(a)?' on':''}" data-fartist="${esc(a)}">${esc(a)}<span class="c">${n}</span></button>`).join('')}</div>
+-    <h3>来源平台</h3><div class="frow">${pc.map(([p,n])=>`<button class="fopt${f.platforms.has(p)?' on':''}" data-fplat="${p}">${({weibo:'微博',pixiv:'Pixiv',pinterest:'Pinterest',upload:'上传'}[p]||p)}<span class="c">${n}</span></button>`).join('')}
+-      <button class="fopt${f.multi?' on':''}" data-fmulti="1">只看一帖多图<span class="c">${multi}</span></button></div>
+-    <h3>排序</h3><select class="fsort" id="sortSel">
+-      <option value="newest"${f.sort==='newest'?' selected':''}>最新</option>
+-      <option value="oldest"${f.sort==='oldest'?' selected':''}>最早</option>
+-      <option value="artist"${f.sort==='artist'?' selected':''}>画师</option>
+-      <option value="size"${f.sort==='size'?' selected':''}>尺寸</option>
+-    </select><div class="sheet-actions"><button id="filterReset">重置</button><button class="primary" id="filterApply">显示 ${preview} 张</button></div>`;
++  const f=state.draft;
++  // 选项旁的数字：其它条件不变时这一项有几张（「同时」模式下是叠加后还剩几张）
++  const count=patch=>filterItems({...f,...patch}).length;
++  const opt=(attr,val,label,on,n)=>`<button class="fopt${on?' on':''}" ${attr}="${esc(val)}" ${!on&&!n?'disabled':''}>${label}${on?'':`<span class="c">${n}</span>`}</button>`;
++  const seg=(attr,cur,opts)=>`<span class="seg">${opts.map(([v,t])=>`<button class="${cur===v?'on':''}" ${attr}="${v}">${t}</button>`).join('')}</span>`;
++  const catNames=[...new Set(state.all.flatMap(allCats))];
++  const catN=c=>count({cats:new Set(f.catMode==='all'?[...f.cats,c]:[c])});
++  const cc=catNames.map(c=>[c,catN(c)]).sort((a,b)=>b[1]-a[1]);
++  const names=followedNames(),byArtist={};
++  state.all.forEach(it=>{const a=it.artist||'';byArtist[a]=(byArtist[a]||0)+1});
++  const artists=Object.keys(byArtist).sort((a,b)=>(names.has(b)-names.has(a))||(byArtist[b]-byArtist[a])).slice(0,60);
++  const plats=[...new Set(state.all.map(platformOf))];
++  const preview=filterItems(f).length;
++  $('#filterBox').innerHTML=`<h2>筛选<small>${tabName(state.tab)}</small></h2>
++    <div class="fsec first"><h3>分类 ${seg('data-catmode',f.catMode,[['any','任一'],['all','同时']])}</h3>
++      <div class="frow">${cc.map(([c,n])=>opt('data-fcat',c,esc(c),f.cats.has(c),n)).join('')}</div></div>
++    <div class="fsec"><h3>画师</h3>
++      <div class="switchrow"><span>只看关注的画师</span><button class="switch${f.onlyFollowed?' on':''}" data-fonly="1"></button></div>
++      <div class="frow">${artists.map(a=>opt('data-fartist',a,(names.has(a)?'<i class="dot"></i>':'')+esc(a||'未知名'),f.artists.has(a),count({artists:new Set([a])}))).join('')}</div></div>
++    <div class="fsec"><h3>来源平台</h3>
++      <div class="frow">${plats.map(p=>opt('data-fplat',p,esc(PLATFORM_NAME[p]||p),f.platforms.has(p),count({platforms:new Set([p])}))).join('')}</div></div>
++    <div class="fsec"><div class="switchrow"><span>只看一帖多图</span><button class="switch${f.multi?' on':''}" data-fmulti="1"></button></div></div>
++    <div class="fsec"><h3>排序 ${seg('data-fsort',f.sort,[['newest','最新'],['oldest','最早'],['artist','画师'],['size','尺寸']])}</h3></div>
++    <div class="sheet-actions sticky"><button id="filterReset">重置</button><button class="primary" id="filterApply" ${preview?'':'disabled'}>显示 ${preview} 张</button></div>`;
+ }
+ 
+ /* follow */
+ function renderFollow(){
+-  $('#followBox').innerHTML=`<h2>关注的画师</h2><div class="sub">在任何卡片上长按画师名即可关注 / 取消</div>
++  $('#followBox').innerHTML=`<h2>关注的画师<small>${state.following.length} 位</small></h2><div class="sub">在任何卡片上长按画师名即可关注 / 取消</div>
+     <div class="switchrow"><span>只看关注画师的图</span><button class="switch${state.filters.onlyFollowed?' on':''}" data-followonly="1"></button></div>`+
+-    (state.following.length?state.following.map(a=>`<div class="followrow"><div class="fa">${a.avatar?`<img src="${a.avatar}" alt="">`:esc((a.artist||'?').slice(0,1))}</div>
+-      <div class="fn">${esc(a.artist)}<small>库里 ${a.kept} 张 · ${a.pending} 张新作待确认</small></div>
+-      <div class="fb"><button data-fwork="${esc(a.artist)}">看作品</button><button class="new" data-fnew="${esc(a.artist)}">找新作</button><button data-fdel="${esc(a.artist)}">取关</button></div></div>`).join('')
++    (state.following.length?state.following.map(a=>`<div class="followrow"><div class="fa">${a.avatar?`<img src="${esc(imgUrl(a.avatar))}" alt="">`:esc((a.artist||'?').slice(0,1))}</div>
++      <div class="fn">${esc(a.artist)}<small>库里 ${a.kept} 张${a.pending?` · <em>${a.pending} 张新作待确认</em>`:''}</small></div>
++      <div class="fb"><button data-fwork="${esc(a.artist)}">看作品</button><button class="new" data-fnew="${esc(a.artist)}">找新作</button><button data-fdel="${esc(a.artist)}" title="取消关注" aria-label="取消关注">取关</button></div></div>`).join('')
+       :`<div style="color:var(--mute);font-size:12px;padding:16px 0">还没有关注画师。</div>`)+
+-    `<div class="sheet-actions"><button id="followDone">完成</button></div>`;
++    `<div class="sheet-actions"><button class="primary" id="followDone">完成</button></div>`;
+   $('#followSheet').classList.add('show');
+ }
+ async function toggleFollow(name){
+   if(!name)return;const has=state.following.some(a=>a.artist===name);
+   try{const j=await api('/api/follow',{artist:name,follow:!has});state.following=j.following||[];
+-    renderAvatars();render();toast(has?'已取消关注':'已关注 '+name)}catch(e){toast(e.message)}
++    renderAvatars();
++    // 就地更新，同一画师的所有卡片一起变；长按中的按钮不能被重建
++    if(state.filters.onlyFollowed)apply(true);
++    else{const names=followedNames();$$('.artist[data-artist]').forEach(x=>x.classList.toggle('followed',names.has(x.dataset.artist)))}
++    toast(has?'已取消关注 '+name:'已关注 '+name+(j.moved?'，'+j.moved+' 张已整理到画师文件夹':''))}catch(e){toast(e.message)}
+ }
+ 
+ /* adjust */
+ function renderAdjust(id){
+   adjustId=id;const it=state.all.find(x=>x.id===id);if(!it)return;
+   const followed=state.following.some(a=>a.artist===it.artist);
+-  const cats=manualCats(it).length?manualCats(it).join('、'):(it.suggested||'未分类');
+-  $('#adjustBox').innerHTML=`<h2>${esc(it.artist||'未知名')}</h2><div class="sub">${esc(it.title||'')}<br>${esc(it.source)} · ${it.width}×${it.height}${it.page_url?' · <a style="color:var(--ac-t)" href="'+esc(it.page_url)+'" target="_blank">原帖</a>':''}</div>
++  const cats=allCats(it).join('、')||'未分类';const na=it.artist?'':' off';
++  $('#adjustBox').innerHTML=`<h2>${esc(it.artist||'未知名')}${it.title?`<small>${esc(it.title)}</small>`:''}</h2><div class="sub">${esc(PLATFORM_NAME[platformOf(it)]||it.source)} · ${it.width}×${it.height}</div>
+     <button class="menurow" data-mrow="cat"><span>分类<small>可多选</small></span><span>${esc(cats)} ›</span></button>
+     <button class="menurow${it.artist?'':' off'}" data-mrow="saveartist"><span>存画师<small>${it.artist?'整理到画师文件夹':'没有画师信息'}</small></span><span>›</span></button>
+-    <button class="menurow" data-mrow="follow"><span>${followed?'取消关注画师':'关注画师'}<small>或长按画师名</small></span><span>${followed?'●':''}</span></button>
+-    <button class="menurow" data-mrow="only"><span>只看这位画师</span><span>›</span></button>
+-    <button class="menurow" data-mrow="new"><span>找这位画师更多作品</span><span>›</span></button>
+-    ${it.page_url?`<a class="menurow" href="${esc(it.page_url)}" target="_blank"><span>打开原帖</span><span>↗</span></a>`:''}
++    <button class="menurow${na}" data-mrow="follow"><span>${followed?'取消关注画师':'关注画师'}<small>或长按画师名</small></span><span></span></button>
++    <button class="menurow${na}" data-mrow="only"><span>只看这位画师</span><span>›</span></button>
++    <button class="menurow${na}" data-mrow="new"><span>找这位画师更多作品</span><span>›</span></button>
++    ${safeUrl(it.page_url)?`<a class="menurow" href="${esc(it.page_url)}" target="_blank" rel="noopener"><span>打开原帖</span><span>↗</span></a>`:''}
++    ${state.local&&it.status==='kept'&&it.filed_path?'<button class="menurow" data-mrow="reveal"><span>打开所在文件夹</span><span>↗</span></button>':''}
+     <button class="menurow ${state.tab==='rejected'?'':'danger'}" data-mrow="${state.tab==='rejected'?'restore':'reject'}"><span>${state.tab==='rejected'?'放回待确认':'不要这张'}</span><span></span></button>
+-    <button class="menurow danger" data-mrow="delete"><span>直接删除<small>同时删磁盘文件，不可撤销</small></span><span>🗑</span></button>
+-    <div class="sheet-actions"><button id="adjustDone">完成</button></div>`;
++    <button class="menurow danger" data-mrow="delete"><span>直接删除<small>同时删磁盘文件，不可撤销</small></span><span></span></button>`;
+   $('#adjustSheet').classList.add('show');
+ }
+ 
+@@ -690,34 +722,41 @@
+ function openViewer(id){viewId=id;updateViewer();$('#viewer').classList.add('show')}
+ function updateViewer(){
+   const it=state.all.find(x=>x.id===viewId);if(!it)return;
+-  $('#big').src='/img/full/'+it.id;
+-  const primary=state.tab==='pending'?'☆ 存分类':state.tab==='kept'?'★ 已存分类':'↩ 放回';
+-  $('#viewerInfo').innerHTML=`<div class="vihead"><b>${esc(it.artist||'未知名')}</b><span>${esc(it.title||'')}</span></div>
+-    <div class="vmeta">${esc(it.source)} · ${it.width}×${it.height}${it.page_url?' · <a href="'+esc(it.page_url)+'" target="_blank">原帖</a>':''}</div>
+-    <div class="vacts"><button class="primary" data-vact="${state.tab==='rejected'?'restore':'savcat'}">${primary}</button>
+-      ${state.tab==='pending'&&it.artist?'<button data-vact="saveartist">存画师</button>':''}
+-      <button data-vact="cat">分类</button><button data-vact="more">⋯</button></div>`;
++  $('#big').removeAttribute('src');$('#big').src=imgUrl('/img/full/'+it.id);
++  const primary=state.tab==='pending'?['savcat','收藏','']:state.tab==='kept'?['unkeep','已收藏',' on']:['restore','放回待确认',''];
++  const link=safeUrl(it.page_url);
++  $('#viewerInfo').innerHTML=`<div class="vihead">${esc(it.artist||'未知名')}</div>
++    <div class="vmeta">${[esc(it.title||''),esc(PLATFORM_NAME[platformOf(it)]||it.source),it.width+'×'+it.height].filter(Boolean).join(' · ')}${link?' · <a href="'+esc(link)+'" target="_blank" rel="noopener">原帖</a>':''}</div>
++    <div class="vacts"><button class="primary${primary[2]}" data-vact="${primary[0]}">${state.tab==='rejected'?ICON.restore:ICON.star}${primary[1]}</button>
++      <button data-vact="cat">${FOLDER_ICON}分类</button><button class="square" data-vact="more" title="调整" aria-label="调整">${ICON.more}</button></div>`;
+ }
+ function moveViewer(d){const ids=state.items.map(x=>x.id),i=ids.indexOf(viewId);if(i<0)return;
+   viewId=ids[(i+d+ids.length)%ids.length];updateViewer()}
+ 
+ /* AI */
++function setBusy(on){const b=$('#more');b.disabled=on;b.innerHTML=on?'…':ICON.enter;$('#moreCancel').style.display=on?'block':'none'}
++function openAi(){$('#aiBox').classList.add('open');$('#aiToggleBtn').classList.add('on')}
++function searchArtist(name){openAi();$('#kw').value='@'+name+' 的新作';scrollTo({top:0,behavior:'smooth'});runMore()}
++function filterArtist(name){state.filters.artists=new Set([name]);state.filters.onlyFollowed=false;apply();
++  scrollTo({top:0,behavior:'smooth'});toast('只看 '+name)}
+ async function runMore(){
+   const raw=$('#kw').value.trim(),limit=Math.max(1,Math.min(50,parseInt($('#limit').value)||10));
+-  $('#more').disabled=true;$('#more').textContent='…';$('#moreState').textContent='';$('#moreCancel').style.display='block';
+-  try{await api('/api/more',{keywords:raw,limit,platform:state.platform});pollMore()}
+-  catch(e){$('#more').disabled=false;$('#more').textContent='⏎';$('#moreCancel').style.display='none';toast(e.message)}
++  setBusy(true);$('#moreState').textContent='';
++  try{await api('/api/more',{keywords:raw,limit,platform:state.platform});pollMore(raw)}
++  catch(e){setBusy(false);toast(e.message)}
+ }
+-async function pollMore(){
++async function pollMore(raw=''){
+   try{const s=await api('/api/more/status');
+-    if(s.state==='running'||s.state==='cancelling'){$('#moreState').textContent=s.state==='cancelling'?'正在取消…':'正在找图…';setTimeout(pollMore,1500);return}
+-    $('#more').disabled=false;$('#more').textContent='⏎';$('#moreCancel').style.display='none';
+-    if(s.state==='done'){$('#moreState').textContent=`新增 ${s.added} 张`;
++    if(s.state==='running'||s.state==='cancelling'){$('#moreState').textContent=s.state==='cancelling'?'正在取消…':'正在找图…';setTimeout(()=>pollMore(raw),1500);return}
++    setBusy(false);
++    if(s.state==='done'){$('#moreState').textContent='';
+       state.tab='pending';$$('#tabs button').forEach(b=>b.classList.toggle('on',b.dataset.tab==='pending'));
+-      await refresh();window.scrollTo({top:0,behavior:'smooth'});toast('找到 '+s.added+' 张')}
+-    else if(s.state==='error'){toast(s.error||'抓取失败')}
+-    else if(s.state==='cancelled'){await refresh()}
+-  }catch(e){$('#more').disabled=false;$('#more').textContent='⏎'}
++      state.filters.artists.clear();
++      await refresh();window.scrollTo({top:0,behavior:'smooth'});
++      toast(s.added?(raw?'「'+raw+'」':'')+'找到 '+s.added+' 张':'没有找到新图')}
++    else if(s.state==='error'){$('#moreState').textContent='';toast(s.error||'抓取失败')}
++    else if(s.state==='cancelled'){$('#moreState').textContent='';await refresh()}
++  }catch(e){setBusy(false)}
+ }
+ function setPlatform(p){state.platform=p;$$('#platformPills button').forEach(b=>b.classList.toggle('on',b.dataset.platform===p));
+   localStorage.setItem('artradar.platform',p)}
+@@ -726,7 +765,7 @@
+   $('#aiQuick').innerHTML=list.map(a=>`<button data-at="${esc(a.artist)}">@${esc(a.artist)}</button>`).join('')+
+     (list.length?'<span class="sep"></span><button data-manage="1">管理</button>':'');
+ }
+-function openLocal(){$('#tabRow').classList.add('searching');$('#localInput').value=state.localQ;$('#localInput').focus()}
++function openLocal(){$('#tabRow').classList.add('searching');$('#localInput').value=state.localQ;$('#localInput').focus();renderActiveFilters()}
+ function closeLocal(clear){$('#tabRow').classList.remove('searching');
+   if(clear){state.localQ='';$('#localInput').value=''}
+   apply()}
+@@ -741,26 +780,27 @@
+ }
+ 
+ /* events */
+-$('#refreshBtn').onclick=()=>refresh();
++$('#refreshBtn').onclick=()=>{const b=$('#refreshBtn');b.classList.remove('spin');void b.offsetWidth;b.classList.add('spin');refresh()};
++$('#libCount').onclick=()=>switchTab('kept');
+ $('#uploadBtn').onclick=()=>$('#fileInput').click();
+ $('#fileInput').onchange=e=>{uploadFiles(e.target.files);e.target.value=''};
+ $('#aiToggleBtn').onclick=()=>{$('#aiBox').classList.toggle('open');$('#aiToggleBtn').classList.toggle('on',$('#aiBox').classList.contains('open'))};
+ $('#settingsBtn').onclick=async()=>{
+   let pair='';try{const j=await api('/api/pair');pair=j.url}catch(e){}
+-  $('#settingsBox').innerHTML=`<h2>设置</h2>
++  $('#settingsBox').classList.add('settings');$('#settingsBox').innerHTML=`<h2>设置</h2>
+     <h3>手机端访问</h3><div class="sub" style="word-break:break-all">${esc(pair)}</div>
+     <div class="frow"><button class="fopt" id="copyPair">复制配对地址</button>${window.AndroidBridge?`<button class="fopt" id="nativeSet">手机连接设置</button>`:''}</div>
+-    <h3>素材库</h3><div class="sub" style="word-break:break-all">${esc(state.root)}</div>
++    <h3>素材库</h3><div class="sub" style="word-break:break-all">${esc(state.root)}</div>${state.local?'<div class="frow"><button class="fopt" id="revealRoot">打开文件夹</button></div>':''}
+     <h3>画师文件夹</h3><div class="sub" style="word-break:break-all">${esc(state.artistsDir)}</div>
+     <h3>AI 搜索</h3><div class="sub">当前为本地意图路由 + 平台抓取；未接外部 DeepSeek 密钥。</div>
+-    <div class="sheet-actions"><button id="settingsDone">完成</button></div>`;
++    <div class="sheet-actions"><button class="primary" id="settingsDone">完成</button></div>`;
+   $('#settingsSheet').classList.add('show');
+ };
+ $('#followOpen').onclick=renderFollow;
+ $('#filterBtn').onclick=openFilter;
+ $('#tabs').onclick=e=>{const b=e.target.closest('[data-tab]');if(!b)return;
+   const tab=b.dataset.tab,dir=TABS.indexOf(tab)>TABS.indexOf(state.tab)?1:-1;switchTab(tab,dir)};
+-$('#selectAll').onclick=()=>{if(sel.size===state.items.length){sel.clear()}else state.items.forEach(x=>sel.add(x.id));syncSel()};
++$('#selectAll').onclick=e=>{e.stopPropagation();if(sel.size===state.items.length){sel.clear()}else state.items.forEach(x=>sel.add(x.id));syncSel()};
+ $('#searchOpen').onclick=openLocal;
+ $('#localInput').oninput=e=>{state.localQ=e.target.value;apply()};
+ $('#localInput').onblur=()=>{if(state.localQ.trim())closeLocal(false);else closeLocal(true)};
+@@ -777,7 +817,7 @@
+ $('#platformPills').onclick=e=>{const b=e.target.closest('[data-platform]');if(b)setPlatform(b.dataset.platform)};
+ $('#moreCancel').onclick=async()=>{try{await api('/api/more/cancel',{})}catch(e){}};
+ let lastY=0;window.addEventListener('scroll',()=>{const y=scrollY;
+-  if(y>120&&y>lastY&&$('#aiBox').classList.contains('open')){$('#aiBox').classList.remove('open');$('#aiToggleBtn').classList.remove('on')}
++  if(y>120&&y>lastY+8&&$('#aiBox').classList.contains('open')){$('#aiBox').classList.remove('open');$('#aiToggleBtn').classList.remove('on')}
+   lastY=y},{passive:true});
+ 
+ $('#grid').onclick=e=>{
+@@ -785,7 +825,7 @@
+   if(view){if(sel.size)selectCard(view.dataset.view,e.shiftKey,e.ctrlKey||e.metaKey);else openViewer(view.dataset.view);return}
+   const card=e.target.closest('.card');
+   const artist=e.target.closest('[data-artist]');
+-  if(artist){if(longPressed){longPressed=false;return}state.filters.artists=new Set([artist.dataset.artist]);apply();return}
++  if(artist){if(longPressed){longPressed=false;return}filterArtist(artist.dataset.artist);return}
+   if(e.target.closest('[data-catpanel]')){if(sel.size)return;openCatPanel([e.target.closest('[data-catpanel]').dataset.catpanel]);return}
+   const act=e.target.closest('[data-act]');
+   if(act){
+@@ -795,16 +835,22 @@
+     else if(a==='reject')rejectItem(id);
+     else if(a==='delete')deleteItem(id);
+     else if(a==='restore')restoreItem(id);
++    else if(a==='unkeep')unkeepItem(id);
+     else if(a==='more')renderAdjust(id);
+     return;
+   }
+   if(card){selectCard(card.dataset.id,e.shiftKey,e.ctrlKey||e.metaKey)}
+ };
+-$('#grid').addEventListener('pointerdown',e=>{const a=e.target.closest('[data-artist]');if(!a)return;
+-  clearTimeout(pressTimer);longPressed=false;pressTimer=setTimeout(()=>{longPressed=true;a.classList.add('pressed');
+-    toggleFollow(a.dataset.artist);setTimeout(()=>{a.classList.remove('pressed');longPressed=false},500)},450)});
+-$('#grid').addEventListener('pointerup',()=>{clearTimeout(pressTimer);$$('.artist.pressed').forEach(x=>x.classList.remove('pressed'))});
+-$('#grid').addEventListener('pointercancel',()=>clearTimeout(pressTimer));
++// 长按画师名：450ms 关注；触发后 longPressed 留到下一次按下才清，多久松手都不会误触发单击筛选
++let pressAt=null;
++function endPress(){clearTimeout(pressTimer);pressAt=null;$$('.artist.pressed').forEach(x=>x.classList.remove('pressed'))}
++$('#grid').addEventListener('pointerdown',e=>{longPressed=false;const a=e.target.closest('[data-artist]');if(!a)return;
++  endPress();pressAt=[e.clientX,e.clientY];a.classList.add('pressed');
++  pressTimer=setTimeout(()=>{longPressed=true;navigator.vibrate&&navigator.vibrate(15);toggleFollow(a.dataset.artist);a.classList.remove('pressed')},450)});
++$('#grid').addEventListener('pointermove',e=>{if(pressAt&&Math.hypot(e.clientX-pressAt[0],e.clientY-pressAt[1])>10)endPress()});
++$('#grid').addEventListener('pointerup',endPress);
++$('#grid').addEventListener('pointercancel',endPress);
++window.addEventListener('scroll',()=>{if(pressAt)endPress()},{passive:true});
+ $('#grid').addEventListener('contextmenu',e=>{if(e.target.closest('.artist'))e.preventDefault()});
+ 
+ $('#filterSheet').onclick=e=>{
+@@ -816,10 +862,10 @@
+   const p=e.target.closest('[data-fplat]');if(p){const v=p.dataset.fplat;f.platforms.has(v)?f.platforms.delete(v):f.platforms.add(v);renderFilterBox();return}
+   const m=e.target.closest('[data-fmulti]');if(m){f.multi=!f.multi;renderFilterBox();return}
+   const o=e.target.closest('[data-fonly]');if(o){f.onlyFollowed=!f.onlyFollowed;renderFilterBox();return}
++  const so=e.target.closest('[data-fsort]');if(so){f.sort=so.dataset.fsort;renderFilterBox();return}
+   if(e.target.id==='filterReset'){state.draft=cloneFilters({cats:new Set(),catMode:'any',artists:new Set(),onlyFollowed:false,platforms:new Set(),multi:false,sort:'newest'});renderFilterBox();return}
+-  if(e.target.id==='filterApply'){state.filters=state.draft;state.draft=null;closeSheet('filterSheet');apply()}
++  if(e.target.id==='filterApply'&&!e.target.disabled){state.filters=state.draft;state.draft=null;closeSheet('filterSheet');apply();scrollTo({top:0,behavior:'smooth'})}
+ };
+-$('#filterSheet').onchange=e=>{if(e.target.id==='sortSel'&&state.draft){state.draft.sort=e.target.value;renderFilterBox()}};
+ $('#activeFilters').onclick=e=>{const b=e.target.closest('[data-rm]');if(!b)return;const k=b.dataset.rm,v=b.dataset.v;
+   if(k==='all'){state.localQ='';$('#localInput').value='';state.filters.cats.clear();state.filters.artists.clear();
+     state.filters.platforms.clear();state.filters.onlyFollowed=false;state.filters.multi=false;state.filters.sort='newest'}
+@@ -843,33 +889,40 @@
+ $('#adjustSheet').onclick=async e=>{if(e.target.id==='adjustSheet'||e.target.id==='adjustDone'){closeSheet('adjustSheet');return}
+   const m=e.target.closest('[data-mrow]');if(!m)return;const it=state.all.find(x=>x.id===adjustId);if(!it)return;
+   const r=m.dataset.mrow;
++  if(r==='reveal'){closeSheet('adjustSheet');try{await api('/api/reveal',{id:adjustId})}catch(err){toast(err.message)}return}
+   if(r==='cat'){closeSheet('adjustSheet');openCatPanel([adjustId]);return}
+   if(r==='saveartist'){closeSheet('adjustSheet');await saveArtist(adjustId);return}
+   if(r==='follow'){await toggleFollow(it.artist);closeSheet('adjustSheet');return}
+-  if(r==='only'){closeSheet('adjustSheet');state.filters.artists=new Set([it.artist||'']);apply();return}
+-  if(r==='new'){closeSheet('adjustSheet');$('#aiBox').classList.add('open');$('#kw').value='@'+(it.artist||'')+' 的新作';runMore();return}
+-  if(r==='reject'){await api('/api/reject',{ids:[adjustId],reason:'网页上调整'});closeSheet('adjustSheet');toast('已移出');await refresh();return}
++  if(r==='only'){closeSheet('adjustSheet');filterArtist(it.artist);return}
++  if(r==='new'){closeSheet('adjustSheet');searchArtist(it.artist);return}
++  if(r==='reject'){closeSheet('adjustSheet');await rejectItem(adjustId);return}
+   if(r==='delete'){closeSheet('adjustSheet');await deleteItem(adjustId);return}
+-  if(r==='restore'){await api('/api/restore',{ids:[adjustId]});closeSheet('adjustSheet');toast('已放回');await refresh();return}
++  if(r==='restore'){closeSheet('adjustSheet');await restoreItem(adjustId);return}
+ };
+ $('#followSheet').onclick=async e=>{if(e.target.id==='followSheet'||e.target.id==='followDone'){closeSheet('followSheet');return}
+   const o=e.target.closest('[data-followonly]');if(o){state.filters.onlyFollowed=!state.filters.onlyFollowed;renderFollow();apply();return}
+-  const w=e.target.closest('[data-fwork]');if(w){closeSheet('followSheet');state.filters.artists=new Set([w.dataset.fwork]);state.filters.onlyFollowed=false;apply();return}
+-  const n=e.target.closest('[data-fnew]');if(n){closeSheet('followSheet');$('#aiBox').classList.add('open');$('#kw').value='@'+n.dataset.fnew+' 的新作';runMore();return}
++  const w=e.target.closest('[data-fwork]');if(w){closeSheet('followSheet');const a=state.following.find(x=>x.artist===w.dataset.fwork);
++    state.filters.artists=new Set([w.dataset.fwork]);state.filters.onlyFollowed=false;
++    if(a&&a.pending&&state.tab!=='pending')switchTab('pending');else apply();scrollTo({top:0,behavior:'smooth'});return}
++  const n=e.target.closest('[data-fnew]');if(n){closeSheet('followSheet');searchArtist(n.dataset.fnew);return}
+   const d=e.target.closest('[data-fdel]');if(d){await toggleFollow(d.dataset.fdel);renderFollow();return}};
+ $('#settingsSheet').onclick=async e=>{if(e.target.id==='settingsSheet'||e.target.id==='settingsDone'){closeSheet('settingsSheet');return}
++  if(e.target.id==='revealRoot'){try{await api('/api/reveal',{})}catch(err){toast(err.message)}return}
+   if(e.target.id==='copyPair'){try{const j=await api('/api/pair');await navigator.clipboard.writeText(j.url);toast('已复制')}catch(err){toast('复制失败')}return}
+   if(e.target.id==='nativeSet'&&window.AndroidBridge){try{window.AndroidBridge.openSettings()}catch(err){}}};
+ 
+ $('#batchbar').onclick=e=>{const b=e.target.closest('[data-batch]');if(!b)return;const act=b.dataset.batch;
+   if(act==='clear'){sel.clear();syncSel();return}
+   if(act==='cat'){openCatPanel([...sel]);return}
+-  if(act==='reject'){if(!confirm('把选中的 '+sel.size+' 张移出待确认？'))return;
+-    api('/api/reject',{ids:[...sel],reason:'网页上批量不要'}).then(()=>{toast('已拒绝');sel.clear();refresh()});return}
++  if(act==='reject'){if(!confirm('把选中的 '+sel.size+' 张移到「已拒绝」？'))return;const ids=[...sel];
++    api('/api/reject',{ids,reason:'网页上批量不要'}).then(()=>{toast(ids.length+' 张已移到「已拒绝」');removeCards(ids)}).catch(err=>toast(err.message));return}
++  if(act==='restore'){const ids=[...sel];
++    api('/api/restore',{ids}).then(()=>{toast(ids.length+' 张已放回待确认');removeCards(ids)}).catch(err=>toast(err.message));return}
+   if(act==='fav'){if(batchBusy)return;batchBusy=true;
+-    (async()=>{try{await api('/api/accept',{ids:[...sel],async:true});toast('开始存分类…');
++    (async()=>{try{await api('/api/accept',{ids:[...sel],async:true,by_follow:true});toast('正在收藏…');
+       let s;do{await new Promise(r=>setTimeout(r,800));s=await api('/api/accept/status')}while(s.state==='running');
+-      toast('已存 '+s.added+' 张');sel.clear();await refresh()}catch(err){toast(err.message)}finally{batchBusy=false}})()}};
++      const failed=s.total-s.added;
++      toast(s.added+' 张已收藏'+(failed?'，'+failed+' 张失败':'')+(s.low_res?'，'+s.low_res+' 张只存到预览图':''));await softReload()}catch(err){toast(err.message)}finally{batchBusy=false}})()}};
+ 
+ $('#viewerClose').onclick=()=>$('#viewer').classList.remove('show');
+ $('#viewerPrev').onclick=()=>moveViewer(-1);
+@@ -878,8 +931,8 @@
+   const a=e.target.closest('[data-vact]');if(!a)return;const it=state.all.find(x=>x.id===viewId);if(!it)return;
+   const act=a.dataset.vact;
+   if(act==='savcat'){$('#viewer').classList.remove('show');saveCategory(it.id)}
+-  else if(act==='saveartist'){$('#viewer').classList.remove('show');saveArtist(it.id)}
+   else if(act==='restore'){$('#viewer').classList.remove('show');restoreItem(it.id)}
++  else if(act==='unkeep'){$('#viewer').classList.remove('show');unkeepItem(it.id)}
+   else if(act==='cat'){$('#viewer').classList.remove('show');openCatPanel([it.id])}
+   else if(act==='more'){$('#viewer').classList.remove('show');renderAdjust(it.id)}};
+ document.addEventListener('keydown',e=>{if(!$('#viewer').classList.contains('show'))return;
+@@ -889,7 +942,7 @@
+   if(Math.abs(d)>50)moveViewer(d>0?-1:1)},{passive:true});
+ 
+ /* full-screen horizontal swipe / trackpad / keyboard tab switch */
+-function overlayOpen(){return !!document.querySelector('.sheet.show')||$('#viewer').classList.contains('show')||$('#loading').classList.contains('show')}
++function overlayOpen(){return !!document.querySelector('.sheet.show')||$('#viewer').classList.contains('show')}
+ function swipeAllowed(target){
+   if(overlayOpen())return false;
+   return !target.closest('input,textarea,select,button,a,.batch,.tabs,.catquick,.platforms,.localsearch,.cardbar');
+@@ -934,14 +987,25 @@
+ document.addEventListener('drop',e=>{if(e.dataTransfer.files.length){e.preventDefault();uploadFiles(e.dataTransfer.files)}});
+ 
+ function closeSheet(id){$('#'+id).classList.remove('show')}
++// 手机返回键先关大图和面板，不直接退出 App：打开时压一条历史，返回时统一收起
++let backPushed=false;
++function syncBack(){const open=overlayOpen();
++  if(open&&!backPushed){history.pushState({overlay:1},'');backPushed=true}
++  else if(!open&&backPushed){backPushed=false;history.back()}}
++window.addEventListener('popstate',()=>{backPushed=false;$$('.sheet.show').forEach(x=>x.classList.remove('show'));$('#viewer').classList.remove('show')});
++const overlayWatch=new MutationObserver(syncBack);
++$$('.sheet,#viewer').forEach(x=>overlayWatch.observe(x,{attributes:true,attributeFilter:['class']}));
+ setPlatform(localStorage.getItem('artradar.platform')||'all');
+ const sl=localStorage.getItem('artradar.limit');if(sl)$('#limit').value=sl;
+ $('#limit').onchange=()=>localStorage.setItem('artradar.limit',$('#limit').value);
+ if(!localStorage.getItem('artradar.hint')){localStorage.setItem('artradar.hint','1');
+-  setTimeout(()=>toast('点画师名只看他 · 长按关注'),1000)}
++  setTimeout(()=>toast('点画师名只看 TA · 长按关注'),1000)}
+ if(window.AndroidBridge)document.body.classList.add('android');
+ $('#aiToggleBtn').classList.add('on');
++setBusy(false);
+ refresh();
++// 抓取中刷新页面：接着显示进度，不让人误以为没在跑
++api('/api/more/status').then(s=>{if(s.state==='running'||s.state==='cancelling'){setBusy(true);pollMore()}}).catch(()=>{});
+ </script>
+ </body>
+ </html>
+--- a/art-radar/README.md
++++ b/art-radar/README.md
+@@ -83,7 +83,7 @@
+ 
+ - 顶栏：`ArtRadar` 衬线字标 + 找新图 / 上传 / 刷新 / 设置四个图标
+ - 第二行：左侧「N 张入库」（已收藏数），右侧关注画师头像 + 新作提示
+-- 三个标签页带数量：待确认 / 已收藏 / 已拒绝；`全选` 在搜索图标左边
++- 三个标签页带数量：待确认 / 已收藏 / 已拒绝
+ - `筛选` 在「待确认」左边：分类（任一 / 同时）、画师、来源平台、一帖多图、排序；
+   面板内是草稿，底部实时显示「显示 N 张」，点遮罩不保存
+ - tab 下是分类快捷行，横向滚动，点一下按分类看
+@@ -91,7 +91,7 @@
+   搜不到可以「去网上找」，只把词填进 AI 搜索框，不会自动抓取
+ - `AI 搜索` 由顶栏 ⊕ 展开/收起：关键词 + 数量 + `⏎`；平台在下面；
+   输入框聚焦会出现关注画师快捷行，点名字插入 `@名字`；往下翻图会自动收起
+-- 手机两列瀑布流、图片原比例；PC 是整齐的等宽网格；图上不叠任何按钮或文字
++- 手机两列、PC 多列瀑布流，图片都保持原比例；图上不叠任何按钮或文字
+ 
+ 卡片：
+ 
+@@ -99,14 +99,16 @@
+ - 点卡片文字或空白区域：选中/取消；第一张选中后进入多选模式
+ - 多选模式下：卡片操作图标隐藏，换成圆形勾选框，图片上出现选中框
+ - 分类文字点一下打开多选分类面板；AI 建议用虚线，人工分类是实线
+-- 卡片操作是同一套线性图标：
+-  - `☆` 存分类：存到当前人工分类；没有人工分类时用 AI 建议分类
+-  - 半身人形 存画师：整理到 `画师/<画师>`
+-  - 红叉 拒绝：移出待确认
+-  - 垃圾桶 直接删除：同时删磁盘文件和边车，弹确认
+-  - `⋯` 更多：分类、存画师、关注画师、只看这位画师、找更多作品、原帖、不要/放回、直接删除
+-- 已收藏里星号显示为“已存分类”，已拒绝里换成放回图标
+-- 一帖多图在画师行右侧显示 `N 图`
++- 画师名那行右边只有两个图标：
++  - `☆` 收藏：已关注的画师进 `画师/<画师>`，其他的进第一个人工分类的文件夹，
++    没有人工分类时用 AI 建议分类。多个分类都会记在索引和边车里，文件只放一份
++  - `⋯` 调整：分类、存画师、关注画师、只看这位画师、找更多作品、原帖、不要/放回、直接删除
++- 已收藏里星号是实心，点一下取消收藏（文件暂存到 `.artradar/unfiled`，再次收藏放回原处）；
++  已拒绝里换成放回图标
++- 已收藏的图改分类时，文件不在新分类里就移过去；已在画师文件夹的不动
++- 关注画师时，TA 已收藏的图自动移到 `画师/<画师>`，分类不变；启动时也会补一遍。取关不搬回去
++- 电脑上 `⋯` 里有「打开所在文件夹」，设置里能打开素材库；手机上不显示
++- 一帖多图在分类右侧显示 `N 图`
+ - 尺寸和平台只在大图信息里显示，不在卡片上出现
+ 
+ 画师：
+@@ -117,13 +119,13 @@
+ 
+ 多选：
+ 
+-- 选中一张就进入多选，底部出现 `☆ 存分类`、`分类`、`不要`
+-- 顶部 `全选` / `取消全选` 选中当前筛选结果
++- 选中一张就进入多选，底部出现 `☆ 收藏`、`分类`、`不要`（已拒绝里是 `放回`）、`全选`、`取消`
++- `全选` 选中当前筛选结果
+ - 批量分类只追加，不会删除原有分类
+ 
+ 大图：
+ 
+-- 底部是存分类、存画师、分类、`⋯`，同时显示完整信息
++- 底部是收藏、分类、`⋯`，同时显示完整信息；手机返回键先关大图和面板，不退出 App
+ - 左右按钮或手机左右滑切换上一张 / 下一张
+ 
+ 切换与加载：
+@@ -131,6 +133,7 @@
+ - 手机全屏左右滑、PC 鼠标拖拽 / 触控板横滑 / 键盘 ← → 都能切换
+   待确认 / 已收藏 / 已拒绝
+ - 切 tab、刷新时先清空旧卡片，显示「正在加载…」转圈；请求慢也不会停留在上一页
++- 收藏、拒绝、分类这些操作就地更新，不清空列表，也不丢滚动位置
+ - 页面切换、卡片、面板、按钮、勾选都有过渡动画；系统开启「减少动态效果」时自动减弱
+ 
+ 上传：
+@@ -172,7 +175,8 @@
+ 不是模型对话。真正开放式的描述（比如“黄昏逆光、人物背对镜头、像新海诚那种”）请直接在
+ DSH 对话里说，Agent 会按你的话调用采集命令。
+ 
+-界面只监听 `127.0.0.1`，不对外网开放。已加入开机启动项（`art-radar UI.lnk`），
++服务默认监听 `0.0.0.0`，手机才能在局域网连上。本机访问（Host 是 localhost / 127.0.0.1）免令牌，
++其它来源的页面、接口和图片都要配对令牌；跨站 POST 会被拒绝。已加入开机启动项（`art-radar UI.lnk`），
+ 重启后会自动在后台运行；如果打不开，手动跑上面的命令。
+ 
+ ## 每日流程
+@@ -255,6 +259,8 @@
+ - 关注画师头像上的小圆点目前基于「该画师有 pending 作品」；还没有后台定时拉取关注画师更新。
+ - 「库里有相似图」提示还没做，只在采集入库时用 pHash 静默去重。
+ - 真机目前只在 MuMu 模拟器上点过，物理手机上的长按/滑动还需要再验证。
++- `@画师` 目前固定走微博（`detect_mode`）：Pixiv 画师搜不到，放在关键词后面的 `@画师` 也不会限定画师。
++- 原图下载失败时会存预览图，并在边车里标 `low_res`、提示用户；还没有批量补原图的入口。
+ - 分类 AI 猜测使用文件名 + 肤色/色调/对比度启发式，不是视觉大模型。
+ - 平台选项按实际来源保留 Pinterest；原型里的 X 目前没有独立抓取器。
+ 
+--- a/mobile/README.md
++++ b/mobile/README.md
+@@ -16,17 +16,16 @@
+ - 顶部：找新图 / 上传 / 刷新 / 设置四个图标；第二行已收藏数 + 关注画师头像
+ - 手机两列瀑布流，图片保持原比例，图上不叠按钮或文字
+ - 点图片看大图；点文字或空白区域选中。连续点可多选，电脑上支持 Ctrl / Shift
+-- `全选` / `取消全选` 在 tab 行右侧
+-- 选中后卡片操作图标隐藏，换成圆形勾选框；底部批量存分类、分类、不要
++- 选中后卡片操作图标隐藏，换成圆形勾选框；底部批量收藏、分类、不要、全选
+ - 分类文字点一下打开多选面板；AI 虚线、人工实线
+-- 卡片图标：`☆` 存分类、半身人形 存画师、红叉 拒绝、垃圾桶 直接删除、`⋯` 更多
+-- `⋯` 里也有存画师 / 直接删除 / 分类 / 关注 / 只看 / 找更多 / 原帖 / 不要
++- 卡片图标：`☆` 收藏、`⋯` 调整
++- `⋯` 里有分类 / 存画师 / 关注 / 只看 / 找更多 / 原帖 / 不要 / 直接删除
+ - 点画师名筛选；长按画师名关注/取消关注
+ - 关注列表：看作品、找新作、取关
+ - AI 搜索由 ⊕ 展开，关键词 + 数量 + 平台；`@画师` 只搜该画师
+ - 筛选是草稿模式，底部实时显示张数；tab 下有分类快捷行
+ - 本地搜索盖住整行，失焦保留词，无结果只填 AI 搜索框
+-- 大图底部存分类 / 存画师 / 分类 / ⋯，支持左右按钮或滑动切换
++- 大图底部收藏 / 分类 / ⋯，支持左右按钮或滑动切换；返回键先关大图和面板
+ - 全屏左右滑切换待确认 / 已收藏 / 已拒绝；PC 支持鼠标拖拽、触控板横滑、← →
+ - 切 tab / 刷新先显示「正在加载…」，不会停留在上一页
+ - **上传图片**：顶部上传图标或系统文件选择器，自动建议分类
