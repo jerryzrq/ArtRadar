@@ -117,14 +117,16 @@ powershell -ExecutionPolicy Bypass -File art-radar\build_exe.ps1
 
 ```
 ArtRadar.spec              PyInstaller 打包配置
+config.example.toml        配置模板（复制为 config.toml 再改）
+LICENSE                    Apache License 2.0
 art-radar/
   app.py                   exe 入口
   artradar.py              采集 / 归档 CLI
   server.py                本地 HTTP 服务
   ui.html                  网页界面（内嵌进 exe）
-  config.example.toml      配置模板
   scripts/                 计划任务、代理检查等辅助脚本
   build_exe.ps1            打包脚本
+  README.md                界面 / 命令 / 配置的详细说明
 mobile/                    Android 客户端源码与 APK
 screenshots/               README 用截图
 ```
@@ -149,10 +151,12 @@ screenshots/               README 用截图
 
 ## 致谢 / Special Thanks
 
-Special Thanks to: 森岫Official & His almighty Cutex
+Special Thanks to: 森岫Official & His almighty Cutex :)
 
 see Cutex at: https://github.com/senxiu-official/cutex-desktop
 
 ## 许可
 
-仓库目前没有 LICENSE 文件，默认保留所有权利。如果需要开放使用，建议补一个 MIT 或 Apache-2.0。
+[Apache License 2.0](LICENSE) © 2026 jerryzrq
+
+可以自由使用、修改、分发（含商用），保留版权与许可声明即可，详见 [LICENSE](LICENSE)。

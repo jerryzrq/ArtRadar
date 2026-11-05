@@ -1,41 +1,34 @@
-# art-radar · 每日绘画参考采集与归档
+# art-radar · 每日绘画参考采集与归档（详细文档）
 
-每天自动从 Pixiv / 微博 / Pinterest 收集候选，我确认后归档到 `D:\Paintings\素材`，
-并提供本地网页界面直接点击「存画师 / 存到分类 / 删除」。
+art-radar 是 ArtRadar 的核心：从 Pixiv / 微博 / Pinterest 收集绘画参考候选，写进待确认清单，
+再通过本地网页界面确认、分类，归档到图库根目录下的分类文件夹。
+
+> 第一次用请先看仓库根目录的 [README](../README.md)；这里是与界面、命令、配置相关的细节。
 
 ## 单文件 exe
 
-已经打包成单文件，放在项目工作区：
-
-```
-D:\ArtRadar\dist\ArtRadar.exe
-```
+打包产物在 `dist\ArtRadar.exe`：
 
 - 双击：启动素材库 UI 并自动打开浏览器
 - 关闭黑色控制台窗口即停止服务
-- 项目里有开机启动项 `art-radar UI`，指向这个 exe
 - 也可以当命令行用：
 
 ```powershell
-& "$PWD\dist\ArtRadar.exe" stats
-& "$PWD\dist\ArtRadar.exe" collect
-& "$PWD\dist\ArtRadar.exe" more 光影
-& "$PWD\dist\ArtRadar.exe" login --pinterest
+.\dist\ArtRadar.exe stats
+.\dist\ArtRadar.exe collect
+.\dist\ArtRadar.exe more 光影
+.\dist\ArtRadar.exe login --pinterest
 ```
 
-- 配置已内置；如果 exe 同目录放一个 `config.toml`，会优先使用它（方便改图库路径）
+- 配置已内置一份；如果 exe 同目录放一个 `config.toml`，会优先使用它（方便改图库路径）
 - Playwright 驱动已打进 exe，但抓 Pixiv / 微博 / Pinterest 仍需要系统安装 Chrome
 - 单文件每次启动会解压到临时目录，首次打开约 5–10 秒
-- 重新打包：`powershell -ExecutionPolicy Bypass -File art-radar\build_exe.ps1`
-  构建结果只写到 `dist\ArtRadar.exe`，不会再复制到 `D:\Paintings`
+- 重新打包：`powershell -ExecutionPolicy Bypass -File art-radar\build_exe.ps1`，
+  构建结果只写到 `dist\ArtRadar.exe`
 
 ## 手机端（Android）
 
-安装包：
-
-```
-D:\ArtRadar\mobile\ArtRadarMobile.apk
-```
+安装包在 `mobile\ArtRadarMobile.apk`。详细说明和重新打包步骤见 **[mobile/README.md](../mobile/README.md)**。
 
 1. 手机和电脑连同一个 Wi-Fi。
 2. 电脑打开 ArtRadar，点网页右上角 **⚙ 设置**，复制「手机端访问」地址。
@@ -47,28 +40,27 @@ D:\ArtRadar\mobile\ArtRadarMobile.apk
 后台每约 15 分钟检查一次待确认数，有新图或每天 9 点后第一次检查时发通知。
 这是局域网本地通知，不是 FCM 云推送：PC 关机/断网/换 IP 时收不到，需要重新配对。
 
-详细说明和重新打包步骤见 **[mobile/README.md](../mobile/README.md)**。
-
-## 现在的结构
+## 数据流
 
 ```
-采集器（Windows 任务计划 07:30）
+采集器（Windows 任务计划，默认 07:30）
   Pixiv 日榜 / 新人榜 / 标签搜索（構図・光・ポーズ・背景・衣装）
   Pixiv 关注流（登录后）
-  微博指定画师主页（UID 列表）
+  微博指定画师主页（UID 列表）+ 关注列表自动发现
   Pinterest 搜索页（可登录，默认匿名）
         ↓
-待确认清单 + 缩略图 + 今日精选（.artradar/）
+待确认清单 + 缩略图 + 今日精选（.artradar\）
         ↓
-本地网页 UI（http://127.0.0.1:8765/）或 DSH 对话
+本地网页 UI（http://127.0.0.1:8765/）或命令行
         ↓
-D:\Paintings\素材\<分类>\   或   D:\Paintings\素材\画师\<画师>\
+<图库根目录>\<分类>\   或   <图库根目录>\画师\<画师>\
 ```
 
 ## 图库
 
-- `D:\Paintings\素材` 沿用你原有的分类文件夹（动态、场景、服装、人像、色彩参考……）。
-- 新增/确认使用的分类：`光影`、`构图`、`人体`、`cosplay`、`角色参考`。
+- 图库根目录由 `config.toml` 的 `[paths].root` 指定，例如 `D:/Art/Reference`。
+- 分类文件夹就建在图库根目录下：`光影`、`动态`、`场景`、`构图`、`人体`、`服装`、`cosplay`、`角色参考`。
+  想让别的名字生效，改 `[filing].tags` 即可。
 - 画师作品默认进 `画师\<画师名>\`；没有该文件夹会自动新建。
 - 每张图旁边有一个同名 `.json`，记录来源、画师、原帖、标签、备注、分辨率、采集时间。
 - `.artradar\` 是隐藏工作区：索引、缩略图、待确认清单、日志、浏览器登录态，不要手动改。
@@ -104,10 +96,10 @@ python art-radar\server.py --port 8765 --open
 - 点图片：打开大图（多选模式下改为切换选中）
 - 点卡片文字或空白区域：选中/取消；第一张选中后进入多选模式
 - 多选模式下：卡片操作图标隐藏，换成圆形勾选框，图片上出现选中框
-- 分类文字点一下打开多选分类面板；AI 建议用虚线，人工分类是实线
+- 分类文字点一下打开多选分类面板；自动建议用虚线，人工分类是实线
 - 画师名那行右边是同一套线性图标：
   - `☆` 收藏：已关注的画师进 `画师/<画师>`，其他的进第一个人工分类的文件夹，
-    没有人工分类时用 AI 建议分类。多个分类都会记在索引和边车里，文件只放一份
+    没有人工分类时用自动建议分类。多个分类都会记在索引和边车里，文件只放一份
   - 半身人形 存画师：整理到 `画师/<画师>`
   - 红叉 拒绝：移到「已拒绝」
   - `⋯` 调整：分类、存画师、关注画师、只看这位画师、找更多作品、原帖、不要/放回、直接删除
@@ -170,9 +162,9 @@ python art-radar\server.py --port 8765 --open
   例如「侦探服」会先搜 `detective costume`，只有它完全没结果时才回退到「侦探服 / 侦探」，
   避免中文宽泛词混进无关图。
 - 自然语言会先识别意图：
-  - 含「微博」→ 抓你关注的画师最新作品
-  - 如果里面写了某个账号名（如「找博主艺类的图片」）→ 只抓这个账号，包含它转发/搬运的作品；
-    账号不需要被识别成画师，只要在你关注列表里就能按名字找到
+  - 含「微博」→ 抓关注画师的最近作品
+  - 如果里面写了某个账号名 → 只抓这个账号，包含它转发/搬运的作品；
+    账号不需要被识别成画师，只要在关注列表里就能按名字找到
   - 含「Pixiv」→ Pixiv 关注流 + 标签
   - 含「Pinterest」→ 只搜 Pinterest
   - 其余按关键词处理
@@ -182,45 +174,43 @@ python art-radar\server.py --port 8765 --open
 - 自动质量过滤：近乎空白、严重模糊、压缩过度、细节极少的图会直接进「已拒绝」并标注原因；
   人体崩坏这类需要视觉模型判断的问题，目前还要靠手动拒绝
 
-注意：网页服务是独立进程，拿不到 DSH 桌面端的模型登录态，所以这里是**本地意图解析**，
-不是模型对话。真正开放式的描述（比如“黄昏逆光、人物背对镜头、像新海诚那种”）请直接在
-DSH 对话里说，Agent 会按你的话调用采集命令。
+注意：网页服务是独立进程，不接任何大模型接口，所以「AI 搜索」是**本地意图解析**，
+不是模型对话。真正开放式的描述（比如“黄昏逆光、人物背对镜头、像新海诚那种”）需要自己
+翻译成关键词，或用命令行 / 二次开发接自己的模型。
 
 服务默认监听 `0.0.0.0`，手机才能在局域网连上。本机访问（Host 是 localhost / 127.0.0.1）免令牌，
-其它来源的页面、接口和图片都要配对令牌；跨站 POST 会被拒绝。已加入开机启动项（`art-radar UI.lnk`），
-重启后会自动在后台运行；如果打不开，手动跑上面的命令。
+其它来源的页面、接口和图片都要配对令牌；跨站 POST 会被拒绝。
+想让它在登录后自动运行，可以把 exe 的快捷方式放进启动目录（`shell:startup`）。
 
 ## 每日流程
 
 1. **07:30** Windows 任务计划 `ArtRadar-Collect`：`collect` → `pick --n 12`。
-   日志在 `D:\Paintings\素材\.artradar\logs\collect-YYYYMMDD.log`。
-2. **09:00** DSH 定时消息：列出今日精选编号 + 管理链接。
-3. 你在网页上点几下完成收藏；不点也会保留 10 天，之后自动过期。
-4. 也可以在对话里说「收 3、7，3 放光影」，Agent 调 CLI 归档。
+   日志在 `<图库根目录>\.artradar\logs\collect-YYYYMMDD.log`。
+2. 打开网页，看今日精选，点几下完成收藏；不点也会保留 10 天，之后自动过期。
+3. 也可以用命令行 `accept` 归档（见下）。
 
 ## 常用命令
 
 ```powershell
-$py = "C:\Users\pc\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe"
-
-& $py art-radar\artradar.py collect                 # 抓所有启用的来源
-& $py art-radar\artradar.py collect --source pixiv-follow
-& $py art-radar\artradar.py pick --n 12             # 生成今日精选
-& $py art-radar\artradar.py pending                 # 待确认
-& $py art-radar\artradar.py accept 3 --artist       # 按编号归档到画师目录
-& $py art-radar\artradar.py accept 5 --tag 光影
-& $py art-radar\artradar.py reject 9 --reason "重复"
-& $py art-radar\artradar.py scan                    # 登记已有图片（会出现在已收藏，按文件夹分类）
-& $py art-radar\artradar.py stats
+python art-radar\artradar.py collect                 # 抓所有启用的来源
+python art-radar\artradar.py collect --source pixiv-follow
+python art-radar\artradar.py pick --n 12             # 生成今日精选
+python art-radar\artradar.py pending                 # 待确认
+python art-radar\artradar.py accept 3 --artist       # 按编号归档到画师目录
+python art-radar\artradar.py accept 5 --tag 光影
+python art-radar\artradar.py reject 9 --reason "重复"
+python art-radar\artradar.py scan                    # 登记已有图片（会出现在已收藏，按文件夹分类）
+python art-radar\artradar.py stats
 ```
 
 `accept` 的编号优先按 `today.json`（今日精选），其次按 `pending.json`（完整待确认）。
 
 ## 来源配置
 
-编辑 `art-radar\config.toml`：
+编辑 `config.toml`（从根目录的 `config.example.toml` 复制）：
 
-- `[collect].proxy`：蓝灯本地代理 `http://127.0.0.1:22307`。
+- `[paths].root`：图库根目录。
+- `[collect].proxy`：需要代理才能访问 Pixiv / Pinterest 时填，例如 `http://127.0.0.1:7890`；留空则直连。
 - `[[sources]]`：按 `enabled` 开关。
 - `pixiv_tag.tags`：想找的参考方向，默认 `構図 / 光 / ポーズ / 背景 / 衣装`。
 - `weibo_artists.uids`：想固定抓的微博画师 UID；微博个人主页 URL 里的数字就是 UID。
@@ -230,14 +220,15 @@ $py = "C:\Users\pc\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\pyt
   直到找到未入库的作品。`per_uid` 按**动态条数**计，一条多图微博里的所有图片都会收下来。
 - `pinterest_search.queries`：Pinterest 搜索词，默认覆盖光影、动态、场景、构图、人体、服装、cosplay。
 - `[filing].tags`：分类名，必须和图库里的文件夹对应。
+- `[review]`：`top_n` 今日精选条数、`expire_days` 候选保留天数。
 
 ## 登录态
 
-Pixiv 和微博的登录态保存在 `.artradar\browser`（独立 Chrome 配置，不碰你日常浏览器）。
+Pixiv 和微博的登录态保存在 `.artradar\browser`（独立 Chrome 配置，不碰日常浏览器）。
 需要重新登录时：
 
 ```powershell
-& $py art-radar\artradar.py login
+python art-radar\artradar.py login
 ```
 
 会打开一个 Chrome 窗口，登录 Pixiv（第一个标签）和微博（第二个标签），检测到后自动保存并关闭。
@@ -245,42 +236,40 @@ Pixiv 和微博的登录态保存在 `.artradar\browser`（独立 Chrome 配置�
 Pinterest 可选登录：
 
 ```powershell
-& $py art-radar\artradar.py login --pinterest
+python art-radar\artradar.py login --pinterest
 ```
 
 登录态保存在 `.artradar/pinterest-browser`。有登录态时，Pinterest 搜索会使用该账号，
-结果更接近你平时登录后看到的；没有登录态时退回匿名公开搜索。
+结果更接近平时登录后看到的；没有登录态时退回匿名公开搜索。
 主账号自动化有被限流/验证的风险，建议降低搜索频率；出现验证时先在浏览器里手动通过。
 
 ## 定时任务
 
 ```powershell
-# 采集（已注册，每天 07:30）
+# 注册采集任务（每天 07:30）
 powershell -File art-radar\scripts\register_task.ps1 -Time 07:30
 
 # 查看
 C:\Windows\System32\schtasks.exe /Query /TN "ArtRadar-Collect" /FO LIST
 ```
 
-DSH 的 09:00 推送是一个会话内定时提醒；DSH 没开时，下次启动会补最近一次。
-
 ## 尚未实现 / 已知限制
 
 - 收藏/拒绝后的「撤销」还没做，误操作需要去对应标签页恢复或手动处理。
 - 关注画师头像上的小圆点目前基于「该画师有 pending 作品」；还没有后台定时拉取关注画师更新。
 - 「库里有相似图」提示还没做，只在采集入库时用 pHash 静默去重。
-- 真机目前只在 MuMu 模拟器上点过，物理手机上的长按/滑动还需要再验证。
+- 真机目前只在模拟器上点过，物理手机上的长按/滑动还需要再验证。
 - `@画师` 目前固定走微博（`detect_mode`）：Pixiv 画师搜不到，放在关键词后面的 `@画师` 也不会限定画师。
 - 原图下载失败时会存预览图，并在边车里标 `low_res`、提示用户；还没有批量补原图的入口。
-- 分类 AI 猜测使用文件名 + 肤色/色调/对比度启发式，不是视觉大模型。
+- 分类猜测使用文件名 + 肤色/色调/对比度启发式，不是视觉大模型。
 - 平台选项按实际来源保留 Pinterest；原型里的 X 目前没有独立抓取器。
 
 ## 注意
 
-- 蓝灯必须保持连接，它是唯一网络出口；代理断开时采集器会尝试自动唤起蓝灯并点「连接」，
-  仍然失败会在界面上明确报错，不会显示成「新增 0 张」。
+- 需要访问 Pixiv / Pinterest 时，代理要在 `config.toml` 里配好并保持在线；
+  代理断开时采集器会明确报错，不会显示成「新增 0 张」。
 - 采集频率很低（每源 10 条以内、下载间隔 1 秒），只抓公开内容。
 - 图只做个人参考，不要二次发布或商用。
-- 微博关注流里品牌/超话很多，所以不走全量关注流；默认按 `weibo_artists.uids` 加上
-  自动发现的画师/艺术博主账号抓取。
+- 微博关注流里品牌/超话很多，所以默认不走全量关注流，而是按 `weibo_artists.uids`
+  加上自动发现的画师/艺术博主账号抓取。
 - 跨来源去重目前基于 pHash（汉明距离 ≤ 6 视为重复），对裁剪/加水印的变体不敏感。

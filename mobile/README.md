@@ -6,7 +6,7 @@
 
 1. 安卓手机安装 `ArtRadarMobile.apk`（允许“安装未知来源应用”）。
 2. 手机和电脑连同一个 Wi-Fi。
-3. 电脑打开 ArtRadar（工作区 `dist\ArtRadar.exe`），点网页右上角 **⚙ 设置**，复制「手机端访问」地址。
+3. 电脑打开 ArtRadar，点网页右上角 **⚙ 设置**，复制「手机端访问」地址。
 4. 手机打开 ArtRadar，把地址粘贴到“配对地址”里；地址里带 `token` 时会自动提取令牌。
 5. 保存并连接。
 
@@ -17,7 +17,7 @@
 - 手机两列瀑布流，图片保持原比例，图上不叠按钮或文字
 - 点图片看大图；点文字或空白区域选中。连续点可多选，电脑上支持 Ctrl / Shift
 - 选中后卡片操作图标隐藏，换成圆形勾选框；底部批量收藏、存画师、分类、不要、删除、全选
-- 分类文字点一下打开多选面板；AI 虚线、人工实线
+- 分类文字点一下打开多选面板；自动建议虚线、人工分类实线
 - 卡片图标：`☆` 收藏、半身人形 存画师、红叉 拒绝、`⋯` 调整
 - 已拒绝里是带圆环的放回箭头
 - `⋯` 里有分类 / 存画师 / 关注 / 只看 / 找更多 / 原帖 / 不要 / 直接删除
@@ -43,16 +43,20 @@
 - PC 的 IP 变了需要重新配对。
 - 首次从手机访问时，Windows 防火墙可能弹窗，请允许 **专用网络**；若没有弹窗，需要管理员放行 TCP 8765。
 - 配对地址里的 token 等于访问密码，不要发到公开群。
-- 目前只在 MuMu 模拟器上验证过长按、多选、大图滑动；物理手机请再点一遍。
+- 目前主要在模拟器上验证过长按、多选、大图滑动；物理手机请再点一遍。
 - 收藏/拒绝后的撤销、库内相似图提示还没实现；关注画师新作圆点目前基于待确认数量。
 
 ## 重新打包
 
-需要 JDK 17、Android build-tools 34、platform android-34（当前在 `C:\AndroidBuild`）：
+需要 JDK 17、Android build-tools 34、platform android-34。SDK 路径在 `build_apk.ps1` 里按本机环境改，
+然后：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File mobile\build_apk.ps1
 ```
 
 输出：`mobile\ArtRadarMobile.apk`。
-签名密钥：`mobile\artradar-release.keystore`（密码 `artradar123`，仅本地测试用；正式分发请换密钥）。
+
+APK 需要签名才能安装。用 `keytool` 自己生成一个 keystore（例如 `artradar-release.keystore`），
+在 `build_apk.ps1` 里配好路径和别名；**keystore 和密码不要提交到仓库**，
+`.gitignore` 里已经排除了 `*.keystore` / `*.jks`。
