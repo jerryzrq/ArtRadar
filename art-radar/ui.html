@@ -165,17 +165,18 @@ body.selecting .photo{cursor:pointer}
 .empty{column-span:all;text-align:center;color:var(--mute);padding:80px 10px;font-family:var(--serif);font-size:16px}
 .empty button{display:block;margin:16px auto 0;height:32px;padding:0 12px;border-radius:8px;background:var(--ac-soft);color:var(--ac-t);
   font-family:-apple-system,"Microsoft YaHei",sans-serif;font-size:13px}
-.batch{position:fixed;left:50%;bottom:18px;transform:translateX(-50%) translateY(160%);z-index:40;
+.batch{position:fixed;left:50%;bottom:calc(18px + env(safe-area-inset-bottom));transform:translateX(-50%) translateY(160%);z-index:50;
   width:calc(min(560px,100vw) - 20px);display:block;background:var(--raise2);border-radius:16px;
-  padding:7px 7px 8px 14px;box-shadow:0 0 0 1px var(--line),0 16px 40px rgba(0,0,0,.5)}
-.batch.show{transform:translateX(-50%) translateY(0)}
+  padding:7px 7px 8px 14px;box-shadow:0 0 0 1px var(--line),0 16px 40px rgba(0,0,0,.5);
+  pointer-events:none}
+.batch.show{transform:translateX(-50%) translateY(0);pointer-events:auto}
 .batch .danger{color:var(--danger)}
 .btop{display:flex;align-items:center;gap:5px;margin-bottom:3px}
-.bactions{display:flex;align-items:center;gap:2px;overflow-x:auto;scrollbar-width:none}
-.bactions::-webkit-scrollbar{display:none}
+.bactions{display:flex;align-items:center;gap:2px;flex-wrap:wrap;overflow:visible}
 .batch .n{flex:1;min-width:0;color:var(--sub);font-size:12px;white-space:nowrap}
 .batch .n b{color:var(--text);font-weight:600;font-size:14px;margin-right:2px}
-.batch button{flex:none;height:33px;padding:0 7px;border-radius:9px;display:flex;align-items:center;gap:3px;font-size:12.5px;color:var(--text);white-space:nowrap}
+.batch button{flex:none;height:33px;padding:0 7px;border-radius:9px;display:flex;align-items:center;gap:3px;font-size:12.5px;color:var(--text);white-space:nowrap;
+  touch-action:manipulation;position:relative;z-index:1;user-select:none;-webkit-user-select:none}
 .batch button:active{background:var(--raise)}
 .batch svg{width:15px;height:15px}
 .batch [data-batch="delete"] svg{width:16px;height:16px}
@@ -1036,7 +1037,7 @@ $('#settingsSheet').oninput=e=>{
   }
 };
 
-$('#batchbar').onclick=e=>{const b=e.target.closest('[data-batch]');if(!b)return;const act=b.dataset.batch;
+async function runBatch(act){
   if(act==='clear'){sel.clear();syncSel();return}
   if(act==='cat'){openCatPanel([...sel]);return}
   if(act==='artist'){
@@ -1065,7 +1066,11 @@ $('#batchbar').onclick=e=>{const b=e.target.closest('[data-batch]');if(!b)return
     (async()=>{try{await api('/api/accept',{ids:[...sel],async:true,by_follow:true});toast('正在收藏…');
       let s;do{await new Promise(r=>setTimeout(r,800));s=await api('/api/accept/status')}while(s.state==='running');
       const failed=s.total-s.added;
-      toast(s.added+' 张已收藏'+(failed?'，'+failed+' 张失败':'')+(s.low_res?'，'+s.low_res+' 张只存到预览图':''));await softReload()}catch(err){toast(err.message)}finally{batchBusy=false}})()}};
+      toast(s.added+' 张已收藏'+(failed?'，'+failed+' 张失败':'')+(s.low_res?'，'+s.low_res+' 张只存到预览图':''));await softReload()}catch(err){toast(err.message)}finally{batchBusy=false}})()}
+}
+$$('#batchbar [data-batch]').forEach(btn=>{
+  btn.addEventListener('click', e=>{e.preventDefault();e.stopPropagation();runBatch(btn.dataset.batch)});
+});
 
 $('#viewerClose').onclick=()=>$('#viewer').classList.remove('show');
 $('#viewerPrev').onclick=()=>moveViewer(-1);
